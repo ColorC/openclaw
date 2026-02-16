@@ -84,3 +84,6 @@ USER.md
 !.agent/workflows/
 /local/
 package-lock.json
+
+# Personal copilot project (unmerged, contains sensitive data)
+_personal_copilot/

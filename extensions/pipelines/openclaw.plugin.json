@@ -1,0 +1,58 @@
+{
+  "id": "pipelines",
+  "name": "Pipelines",
+  "description": "Low-supervision software factory: PM, Generation, Maintenance, Self-Evolution pipelines",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxRetries": {
+        "type": "number",
+        "description": "Maximum retry attempts for pipeline nodes",
+        "default": 3
+      },
+      "retryDelayBase": {
+        "type": "number",
+        "description": "Base delay in ms for exponential backoff",
+        "default": 1000
+      },
+      "defaultTimeout": {
+        "type": "number",
+        "description": "Default timeout in milliseconds for pipeline execution",
+        "default": 300000
+      },
+      "enableCheckpoint": {
+        "type": "boolean",
+        "description": "Enable workflow state checkpointing",
+        "default": true
+      },
+      "checkpointPath": {
+        "type": "string",
+        "description": "Path to store checkpoints (relative to workspace)",
+        "default": ".pipelines/checkpoints"
+      }
+    }
+  },
+  "uiHints": {
+    "maxRetries": {
+      "label": "Max Retries",
+      "help": "Maximum number of retry attempts when a pipeline node fails"
+    },
+    "retryDelayBase": {
+      "label": "Retry Delay Base (ms)",
+      "help": "Base delay for exponential backoff retry strategy"
+    },
+    "defaultTimeout": {
+      "label": "Default Timeout (ms)",
+      "help": "Default timeout for pipeline execution (5 minutes = 300000ms)"
+    },
+    "enableCheckpoint": {
+      "label": "Enable Checkpointing",
+      "help": "Save workflow state to allow resuming interrupted pipelines"
+    },
+    "checkpointPath": {
+      "label": "Checkpoint Path",
+      "help": "Directory to store workflow checkpoints"
+    }
+  }
+}
