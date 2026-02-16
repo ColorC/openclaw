@@ -148,7 +148,7 @@ export interface WorkflowGraphDefinition<S extends WorkflowStateBase> {
  * LangGraph.js 的 CompiledStateGraph 具有复杂的泛型约束
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type CompiledWorkflow<S extends WorkflowStateBase> = CompiledStateGraph<any, any, any, any>;
+export type CompiledWorkflow<_S extends WorkflowStateBase> = CompiledStateGraph<any, any, any, any>;
 
 // ============================================================================
 // 执行追踪

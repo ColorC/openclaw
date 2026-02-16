@@ -28,7 +28,7 @@ import { wrapNode } from "./node-wrapper.js";
  * 使用 LangGraph.js 的 Annotation API 定义状态结构。
  * 对应 Python 版的 TypedDict + Annotated。
  */
-export function createBaseStateAnnotation<S extends WorkflowStateBase>() {
+export function createBaseStateAnnotation<_S extends WorkflowStateBase>() {
   return Annotation.Root({
     // 消息历史：追加模式
     messages: Annotation<BaseMessage[]>({
