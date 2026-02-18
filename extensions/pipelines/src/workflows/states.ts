@@ -57,6 +57,8 @@ export interface RequirementClarificationState {
   conversationHistory?: Array<{ role: string; content: string }>;
   /** 生成的 OpenSpec proposal.md 内容 */
   proposalDocument?: string;
+  /** 生成的 proposal 文件建议路径 */
+  proposalFilePath?: string;
 }
 
 // ============================================================================
@@ -69,6 +71,14 @@ export interface FeatureDefinition {
   description: string;
   type: "user_facing" | "internal" | "infrastructure";
   priority?: "critical" | "high" | "medium" | "low";
+  /** 来源需求 */
+  sourceRequirement?: string;
+  /** 触发者（哪个功能触发了此功能） */
+  triggeredBy?: string;
+  /** 被谁依赖 */
+  requiredBy?: string;
+  /** 是否为隐式推断的功能 */
+  isImplicit?: boolean;
 }
 
 export interface ModuleDefinition {
@@ -77,24 +87,88 @@ export interface ModuleDefinition {
   description: string;
   responsibilities: string[];
   dependencies: string[];
+  /** 所属层级（如 presentation, business, data, infrastructure） */
+  layer?: string;
+  /** 规模估算 */
+  estimatedSize?: { lines: number; files: number; classes: number };
 }
 
 export interface InterfaceDefinition {
   id: string;
   name: string;
-  type: "repository" | "service" | "external" | "api";
+  type: "repository" | "service" | "external" | "api" | "controller" | "adapter";
   methods: Array<{
     name: string;
     input: string;
     output: string;
     description: string;
   }>;
+  /** 由哪个模块提供 */
+  exposedBy?: string;
+  /** 被哪些模块消费 */
+  consumedBy?: string[];
+  /** 所属层级 */
+  layer?: string;
+  /** 接口方向 */
+  direction?: "inbound" | "outbound" | "bidirectional";
 }
 
 export interface ResponsibilityEntry {
   moduleId: string;
   featureId: string;
   responsibility: string;
+}
+
+export interface EntityDefinition {
+  id: string;
+  name: string;
+  description: string;
+  attributes: Array<{
+    name: string;
+    type: string;
+    required: boolean;
+    description?: string;
+  }>;
+  relationships: Array<{
+    target: string;
+    type: "one-to-one" | "one-to-many" | "many-to-many";
+    description?: string;
+  }>;
+  /** 所属模块 */
+  ownerModule?: string;
+}
+
+export interface ApiEndpointDefinition {
+  id: string;
+  /** HTTP 方法 */
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  /** 路径 */
+  path: string;
+  /** 描述 */
+  description: string;
+  /** 请求体 */
+  requestBody?: string;
+  /** 响应体 */
+  responseBody?: string;
+  /** 关联的实体 */
+  relatedEntities?: string[];
+  /** 所属模块 */
+  ownerModule?: string;
+  /** 认证要求 */
+  auth?: boolean;
+}
+
+export interface DomainDefinition {
+  id: string;
+  name: string;
+  description: string;
+  /** 该领域包含的功能 ID */
+  featureIds: string[];
+  /** 与其他领域的交互点 */
+  boundaryInteractions?: Array<{
+    targetDomain: string;
+    description: string;
+  }>;
 }
 
 export interface ArchitectureDesignState {
@@ -115,6 +189,12 @@ export interface ArchitectureDesignState {
     complexity: "low" | "medium" | "high";
     domain: string;
     keyEntities: string[];
+    /** 技术特征（如 concurrency, auth, realtime, persistence） */
+    techFeatures?: string[];
+    /** 分析推理过程 */
+    reasoning?: string;
+    /** 推荐的架构方向 */
+    recommendedArchitecture?: string;
   };
   /** 用户面向功能 */
   userFacingFeatures: FeatureDefinition[];
@@ -129,6 +209,16 @@ export interface ArchitectureDesignState {
     name: string;
     pattern: string;
     description: string;
+    /** 参考的架构模式列表 */
+    referencePatterns?: string[];
+    /** 模块组织方式 */
+    moduleOrganization?: string;
+    /** 通信模式 */
+    communicationPattern?: string;
+    /** 部署架构 */
+    deploymentArchitecture?: string;
+    /** 设计理由 */
+    justification?: string;
   };
   /** 选择的架构模式 */
   selectedPattern?: string;
@@ -138,6 +228,16 @@ export interface ArchitectureDesignState {
   interfaces: InterfaceDefinition[];
   /** 职责矩阵 */
   responsibilityMatrix: ResponsibilityEntry[];
+  /** 数据实体（ER 模型） */
+  entities: EntityDefinition[];
+  /** API 端点 */
+  apiEndpoints: ApiEndpointDefinition[];
+  /** 领域分解（大型项目） */
+  domains: DomainDefinition[];
+  /** 是否启用分阶段交互模式（大型项目 domain 拆分后暂停确认） */
+  interactiveMode?: boolean;
+  /** 用户对 domain 拆分方案的确认结果 */
+  domainApproval?: { approved: boolean; feedback?: string };
 
   // ===== 验证与迭代 =====
   /** 是否需要细化 */
@@ -155,6 +255,47 @@ export interface ArchitectureDesignState {
     omissions: string[];
     couplingIssues: string[];
     suggestions: string[];
+    /** 结构化问题列表 */
+    criticalIssues?: Array<{
+      type: "omission" | "coupling" | "inconsistency";
+      description: string;
+      severity: "high" | "medium";
+      affectedComponents: string[];
+    }>;
+    /** 评审是否通过 */
+    reviewPassed?: boolean;
+    /** 总体评价 */
+    overallAssessment?: string;
+  };
+
+  /** 架构验证详情 */
+  validationResult?: {
+    /** 总体评分 0-100 */
+    overallScore: number;
+    /** 需求覆盖率 0-100 */
+    requirementCoverage: number;
+    /** 发现的问题 */
+    issues: Array<{
+      type: string;
+      description: string;
+      severity: "high" | "medium" | "low";
+      affectedComponents: string[];
+    }>;
+    /** 缺失的接口 */
+    missingInterfaces: Array<{
+      priority: "P0" | "P1" | "P2";
+      name: string;
+      module: string;
+      reason: string;
+    }>;
+    /** 职责冲突 */
+    responsibilityConflicts: Array<{
+      featureIds: string[];
+      sharedModule: string;
+      suggestion: string;
+    }>;
+    /** 修复指令 */
+    refinementInstructions: string[];
   };
 
   // ===== 输出 =====
@@ -237,10 +378,10 @@ export interface CoderState {
   toolsUsed: string[];
 
   // ===== 输出 =====
-  /** 实现代码 */
-  implementationCode?: string;
-  /** 修复后代码 */
-  fixedCode?: string;
+  /** 实现摘要（Agent 自述完成了什么） */
+  implementationSummary?: string;
+  /** 修复摘要（Agent 自述修复了什么） */
+  fixSummary?: string;
   /** 修改的文件列表 */
   modifiedFiles: string[];
   /** 是否成功 */

@@ -15,6 +15,9 @@ import type {
   ModuleDefinition,
   InterfaceDefinition,
   ResponsibilityEntry,
+  EntityDefinition,
+  ApiEndpointDefinition,
+  DomainDefinition,
 } from "./states.js";
 
 // ============================================================================
@@ -42,6 +45,14 @@ export const ArchitectureDesignAnnotation = Annotation.Root({
   modules: Annotation<ModuleDefinition[]>({ default: () => [] }),
   interfaces: Annotation<InterfaceDefinition[]>({ default: () => [] }),
   responsibilityMatrix: Annotation<ResponsibilityEntry[]>({ default: () => [] }),
+  entities: Annotation<EntityDefinition[]>({ default: () => [] }),
+  apiEndpoints: Annotation<ApiEndpointDefinition[]>({ default: () => [] }),
+  domains: Annotation<DomainDefinition[]>({ default: () => [] }),
+  // 交互控制
+  interactiveMode: Annotation<boolean>({ default: () => false }),
+  domainApproval: Annotation<{ approved: boolean; feedback?: string } | undefined>({
+    default: () => undefined,
+  }),
   // 验证
   needsRefinement: Annotation<boolean>({ default: () => false }),
   refinementIteration: Annotation<number>({ default: () => 0 }),
@@ -49,6 +60,9 @@ export const ArchitectureDesignAnnotation = Annotation.Root({
     default: () => [],
   }),
   designReview: Annotation<ArchitectureDesignState["designReview"]>({ default: () => undefined }),
+  validationResult: Annotation<ArchitectureDesignState["validationResult"]>({
+    default: () => undefined,
+  }),
   // 输出
   fileStructure: Annotation<Record<string, unknown> | undefined>({ default: () => undefined }),
   openspecFiles: Annotation<string[]>({ default: () => [] }),
@@ -73,8 +87,12 @@ export interface ArchitectureDesignNodeOverrides {
   analyzeRequirement?: ArchNodeExecutor;
   listFeatures?: ArchNodeExecutor;
   selectPattern?: ArchNodeExecutor;
+  designDomains?: ArchNodeExecutor;
+  awaitDomainApproval?: ArchNodeExecutor;
   designModules?: ArchNodeExecutor;
   defineInterfaces?: ArchNodeExecutor;
+  designDataModel?: ArchNodeExecutor;
+  designApiEndpoints?: ArchNodeExecutor;
   designReview?: ArchNodeExecutor;
   validateArchitecture?: ArchNodeExecutor;
   refineDesign?: ArchNodeExecutor;
@@ -129,12 +147,29 @@ const defaultNodes: Required<ArchitectureDesignNodeOverrides> = {
     };
   },
 
+  async designDomains(_state) {
+    return { domains: [] };
+  },
+
+  async awaitDomainApproval(_state) {
+    // Default: pass through (non-interactive mode)
+    return {};
+  },
+
   async designModules(_state) {
     return { modules: [], responsibilityMatrix: [] };
   },
 
   async defineInterfaces(_state) {
     return { interfaces: [] };
+  },
+
+  async designDataModel(_state) {
+    return { entities: [] };
+  },
+
+  async designApiEndpoints(_state) {
+    return { apiEndpoints: [] };
   },
 
   async designReview(_state) {
@@ -191,6 +226,13 @@ function shouldRefineOrContinue(
   return "file_structure";
 }
 
+function scaleRouter(state: ArchitectureDesignGraphState): "design_domains" | "design_modules" {
+  const scale = state.requirementAnalysis?.scale ?? "medium";
+  const complexity = state.requirementAnalysis?.complexity ?? "medium";
+  if (scale === "large" || complexity === "high") return "design_domains";
+  return "design_modules";
+}
+
 function afterRefine(_state: ArchitectureDesignGraphState): "validate" {
   return "validate";
 }
@@ -199,11 +241,31 @@ function afterRefine(_state: ArchitectureDesignGraphState): "validate" {
 // Graph Builder
 // ============================================================================
 
+/** Wrap a node executor with timing logs */
+function timed(name: string, fn: ArchNodeExecutor): ArchNodeExecutor {
+  return async (state) => {
+    const t0 = Date.now();
+    console.log(`[arch] ▶ ${name}`);
+    try {
+      const result = await fn(state);
+      console.log(`[arch] ✔ ${name}  ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      return result;
+    } catch (err) {
+      console.log(`[arch] ✘ ${name}  ${((Date.now() - t0) / 1000).toFixed(1)}s  ERROR: ${err}`);
+      throw err;
+    }
+  };
+}
+
 /**
  * 创建架构设计工作流图
  */
 export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeOverrides = {}) {
-  const n = { ...defaultNodes, ...overrides };
+  const raw = { ...defaultNodes, ...overrides };
+  // Wrap every node with timing
+  const n = Object.fromEntries(
+    Object.entries(raw).map(([k, v]) => [k, timed(k, v as ArchNodeExecutor)]),
+  ) as Required<ArchitectureDesignNodeOverrides>;
 
   const workflow = new StateGraph(ArchitectureDesignAnnotation)
     // 节点
@@ -212,8 +274,12 @@ export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeO
     .addNode("analyze_requirement", n.analyzeRequirement)
     .addNode("list_features", n.listFeatures)
     .addNode("select_pattern", n.selectPattern)
+    .addNode("design_domains", n.designDomains)
+    .addNode("await_domain_approval", n.awaitDomainApproval)
     .addNode("design_modules", n.designModules)
     .addNode("define_interfaces", n.defineInterfaces)
+    .addNode("design_data_model", n.designDataModel)
+    .addNode("design_api_endpoints", n.designApiEndpoints)
     .addNode("design_review", n.designReview)
     .addNode("validate_architecture", n.validateArchitecture)
     .addNode("refine_design", n.refineDesign)
@@ -233,9 +299,16 @@ export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeO
     })
     .addEdge("analyze_requirement", "list_features")
     .addEdge("list_features", "select_pattern")
-    .addEdge("select_pattern", "design_modules")
+    .addConditionalEdges("select_pattern", scaleRouter, {
+      design_domains: "design_domains",
+      design_modules: "design_modules",
+    })
+    .addEdge("design_domains", "await_domain_approval")
+    .addEdge("await_domain_approval", "design_modules")
     .addEdge("design_modules", "define_interfaces")
-    .addEdge("define_interfaces", "design_review")
+    .addEdge("define_interfaces", "design_data_model")
+    .addEdge("design_data_model", "design_api_endpoints")
+    .addEdge("design_api_endpoints", "design_review")
     .addEdge("design_review", "validate_architecture")
     .addConditionalEdges("validate_architecture", shouldRefineOrContinue, {
       refine: "refine_design",

@@ -16,6 +16,7 @@ import {
   createValidateArchitectureNode,
   createDesignFileStructureNode,
   createGenerateOpenspecNode,
+  createRefineDesignNode,
 } from "./architecture-nodes.js";
 
 // ============================================================================
@@ -39,6 +40,9 @@ function makeState(
     modules: [],
     interfaces: [],
     responsibilityMatrix: [],
+    entities: [],
+    apiEndpoints: [],
+    domains: [],
     needsRefinement: false,
     refinementIteration: 0,
     refinementHistory: [],
@@ -148,19 +152,25 @@ describe("createSelectPatternNode", () => {
     pr = new PromptRegistry();
   });
 
-  it("should select pattern via tool call", async () => {
+  it("should design custom architecture via tool call", async () => {
     const mp = new MockModelProvider([
-      mockToolCallResponse("select_pattern", {
-        pattern: "modular_monolith",
-        name: "Modular Monolith",
+      mockToolCallResponse("custom_architecture_design", {
+        architecture_name: "Modular Monolith",
+        reference_patterns: ["modular_monolith", "layered"],
         description: "Clear module boundaries",
+        module_organization: "By domain",
+        communication_pattern: "Direct method calls",
+        deployment_architecture: "Single deployable",
+        justification: "Best fit for medium scale",
       }),
     ]);
     const node = createSelectPatternNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
-    expect(result.selectedPattern).toBe("modular_monolith");
+    expect(result.selectedPattern).toBe("Modular Monolith");
     expect(result.customArchitecture!.name).toBe("Modular Monolith");
+    expect(result.customArchitecture!.referencePatterns).toEqual(["modular_monolith", "layered"]);
+    expect(result.customArchitecture!.moduleOrganization).toBe("By domain");
   });
 
   it("should fallback to layered when no tool call", async () => {
@@ -183,7 +193,7 @@ describe("createDesignModulesNode", () => {
     pr = new PromptRegistry();
   });
 
-  it("should return modules from tool call", async () => {
+  it("should return modules and responsibility matrix from two-step tool calls", async () => {
     const mp = new MockModelProvider([
       mockToolCallResponse("design_modules", {
         modules: [
@@ -193,6 +203,8 @@ describe("createDesignModulesNode", () => {
             description: "Authentication",
             responsibilities: ["login", "register"],
             dependencies: [],
+            layer: "business",
+            estimatedSize: { lines: 500, files: 3, classes: 4 },
           },
           {
             id: "mod-api",
@@ -200,7 +212,13 @@ describe("createDesignModulesNode", () => {
             description: "API routing",
             responsibilities: ["routing"],
             dependencies: ["mod-auth"],
+            layer: "presentation",
           },
+        ],
+      }),
+      mockToolCallResponse("assign_responsibilities", {
+        matrix: [
+          { moduleId: "mod-auth", featureId: "f-login", responsibility: "Handle user auth" },
         ],
       }),
     ]);
@@ -209,7 +227,10 @@ describe("createDesignModulesNode", () => {
 
     expect(result.modules).toHaveLength(2);
     expect(result.modules![0].id).toBe("mod-auth");
+    expect(result.modules![0].layer).toBe("business");
     expect(result.modules![1].dependencies).toEqual(["mod-auth"]);
+    expect(result.responsibilityMatrix).toHaveLength(1);
+    expect(result.responsibilityMatrix![0].featureId).toBe("f-login");
   });
 });
 
@@ -267,17 +288,30 @@ describe("createDesignReviewNode", () => {
     pr = new PromptRegistry();
   });
 
-  it("should return review findings", async () => {
+  it("should return structured review findings", async () => {
     const mp = new MockModelProvider([
       mockToolCallResponse("design_review", {
-        omissions: ["Missing error handling module"],
-        couplingIssues: [],
-        suggestions: ["Add a logging module"],
+        critical_issues: [
+          {
+            type: "omission",
+            description: "Missing error handling module",
+            severity: "high",
+            affected_components: ["mod-api"],
+          },
+        ],
+        review_passed: false,
+        overall_assessment: "Design needs error handling improvements",
+        priority_recommendations: ["Add a logging module", "Add error handling"],
       }),
     ]);
     const node = createDesignReviewNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
+    expect(result.designReview!.criticalIssues).toHaveLength(1);
+    expect(result.designReview!.criticalIssues![0].type).toBe("omission");
+    expect(result.designReview!.reviewPassed).toBe(false);
+    expect(result.designReview!.overallAssessment).toBe("Design needs error handling improvements");
+    // Backward-compatible flat arrays
     expect(result.designReview!.omissions).toHaveLength(1);
     expect(result.designReview!.suggestions).toContain("Add a logging module");
     expect(mp.calls[0].options?.modelRole).toBe("reviewer");
@@ -295,27 +329,54 @@ describe("createValidateArchitectureNode", () => {
     pr = new PromptRegistry();
   });
 
-  it("should return needsRefinement=true when issues found", async () => {
+  it("should return needsRefinement=true when score is low", async () => {
     const mp = new MockModelProvider([
       mockToolCallResponse("validate_architecture", {
-        needsRefinement: true,
-        reason: "Circular dependency detected",
+        overall_score: 65,
+        requirement_coverage: 70,
+        architecture_issues: [
+          {
+            type: "circular_dependency",
+            description: "Circular dependency detected",
+            severity: "high",
+            affected_components: ["mod-auth", "mod-api"],
+          },
+        ],
+        missing_interfaces: [],
+        responsibility_conflicts: [],
+        needs_refinement: true,
+        refinement_instructions: ["Break circular dependency between auth and api"],
+        validation_summary: "Design has critical issues",
       }),
     ]);
     const node = createValidateArchitectureNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
     expect(result.needsRefinement).toBe(true);
+    expect(result.validationResult).toBeDefined();
+    expect(result.validationResult!.overallScore).toBe(65);
+    expect(result.validationResult!.issues).toHaveLength(1);
+    expect(result.validationResult!.refinementInstructions).toHaveLength(1);
   });
 
   it("should return needsRefinement=false when design is valid", async () => {
     const mp = new MockModelProvider([
-      mockToolCallResponse("validate_architecture", { needsRefinement: false }),
+      mockToolCallResponse("validate_architecture", {
+        overall_score: 92,
+        requirement_coverage: 95,
+        architecture_issues: [],
+        missing_interfaces: [],
+        responsibility_conflicts: [],
+        needs_refinement: false,
+        refinement_instructions: [],
+        validation_summary: "Design is solid",
+      }),
     ]);
     const node = createValidateArchitectureNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
     expect(result.needsRefinement).toBe(false);
+    expect(result.validationResult!.overallScore).toBe(92);
   });
 });
 
@@ -381,10 +442,10 @@ describe("createGenerateOpenspecNode", () => {
       }),
     );
 
-    expect(result.openspecFiles).toEqual(["design.md", "tasks.md"]);
+    expect(result.openspecFiles).toEqual(["design.md", "tasks.md", "spec.md"]);
     expect(result.openspecDocuments).toBeDefined();
-    expect(result.openspecDocuments!["design.md"]).toContain("# Technical Design Document");
-    expect(result.openspecDocuments!["tasks.md"]).toContain("# Implementation Tasks");
+    expect(result.openspecDocuments!["design.md"]).toContain("## Context");
+    expect(result.openspecDocuments!["tasks.md"]).toContain("## 1. Module Implementation");
   });
 
   it("should return documents even with empty state", async () => {
@@ -392,7 +453,93 @@ describe("createGenerateOpenspecNode", () => {
     const node = createGenerateOpenspecNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
-    expect(result.openspecFiles).toEqual(["design.md", "tasks.md"]);
-    expect(result.openspecDocuments!["design.md"]).toContain("# Technical Design Document");
+    expect(result.openspecFiles).toEqual(["design.md", "tasks.md", "spec.md"]);
+    expect(result.openspecDocuments!["design.md"]).toContain("## Context");
+  });
+});
+
+// ============================================================================
+// refineDesign
+// ============================================================================
+
+describe("createRefineDesignNode", () => {
+  let pr: PromptRegistry;
+
+  beforeEach(() => {
+    pr = new PromptRegistry();
+  });
+
+  it("should refine design based on validation issues", async () => {
+    const mp = new MockModelProvider([
+      mockToolCallResponse("refine_design", {
+        refined_modules: [
+          {
+            id: "mod-auth",
+            name: "AuthModule",
+            description: "Auth only",
+            responsibilities: ["login"],
+            dependencies: [],
+            layer: "business",
+          },
+        ],
+        refined_interfaces: [
+          {
+            id: "if-auth",
+            name: "IAuthService",
+            type: "service",
+            methods: [
+              { name: "login", input: "Credentials", output: "Token", description: "Login" },
+            ],
+          },
+        ],
+        changes_made: ["Separated auth from user module"],
+        refinement_summary: "Resolved responsibility conflict",
+      }),
+    ]);
+    const node = createRefineDesignNode({ modelProvider: mp, promptRegistry: pr });
+    const result = await node(
+      makeState({
+        modules: [
+          {
+            id: "mod-auth",
+            name: "Auth",
+            description: "Auth+User",
+            responsibilities: ["login", "profile"],
+            dependencies: [],
+          },
+        ],
+        interfaces: [],
+        validationResult: {
+          overallScore: 60,
+          requirementCoverage: 70,
+          issues: [
+            {
+              type: "overlap",
+              description: "Auth and User mixed",
+              severity: "high",
+              affectedComponents: ["mod-auth"],
+            },
+          ],
+          missingInterfaces: [],
+          responsibilityConflicts: [],
+          refinementInstructions: ["Separate auth from user management"],
+        },
+      }),
+    );
+
+    expect(result.modules).toHaveLength(1);
+    expect(result.modules![0].name).toBe("AuthModule");
+    expect(result.needsRefinement).toBe(false);
+    expect(result.refinementIteration).toBe(1);
+    expect(result.refinementHistory).toHaveLength(1);
+  });
+
+  it("should skip refinement gracefully when no validation result", async () => {
+    const mp = new MockModelProvider([]);
+    const node = createRefineDesignNode({ modelProvider: mp, promptRegistry: pr });
+    const result = await node(makeState());
+
+    expect(result.needsRefinement).toBe(false);
+    expect(result.refinementIteration).toBe(1);
   });
 });
