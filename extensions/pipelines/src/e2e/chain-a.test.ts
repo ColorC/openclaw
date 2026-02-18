@@ -311,8 +311,8 @@ describe("E2E: Chain A — 开发链路", () => {
         }),
         finalize: async (state) => ({
           success: false,
-          fixedCode: undefined,
-          implementationCode: undefined,
+          fixSummary: undefined,
+          implementationSummary: undefined,
         }),
       },
     });

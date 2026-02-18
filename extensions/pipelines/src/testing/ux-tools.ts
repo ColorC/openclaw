@@ -136,7 +136,7 @@ export function createUxTools(deps: UxToolsDeps, finishSignal: FinishSignal): Pi
           const target = args.target as string;
           const userReq = args.user_requirement as string | undefined;
           const wfId = workflowRunner.start(target, targetCtx, targetConfig, userReq);
-          const result = await workflowRunner.waitForInput(wfId, 60);
+          const result = await workflowRunner.waitForInput(wfId, 480);
           return {
             workflow_id: wfId,
             status: result.status,
@@ -169,7 +169,7 @@ export function createUxTools(deps: UxToolsDeps, finishSignal: FinishSignal): Pi
         try {
           const wfId = args.workflow_id as string;
           const response = args.response as string;
-          const result = await workflowRunner.sendResponse(wfId, response);
+          const result = await workflowRunner.sendResponse(wfId, response, 480);
 
           // Auto-record interaction in report builder
           reportBuilder.addInteraction(response, result.prompt ?? result.output ?? "");
@@ -182,6 +182,42 @@ export function createUxTools(deps: UxToolsDeps, finishSignal: FinishSignal): Pi
           };
         } catch (err) {
           return { error: `Failed to send response: ${(err as Error).message}` };
+        }
+      },
+    },
+
+    // 4b. check_status — poll workflow status (useful after clarification completes)
+    {
+      name: "check_status",
+      description:
+        '检查工作流当前状态。在需求澄清完成后，pipeline 会继续运行架构设计，用此工具轮询直到 status="completed"。',
+      parameters: {
+        type: "object",
+        properties: {
+          workflow_id: {
+            type: "string",
+            description: '工作流 ID，或 "auto" 使用最近的工作流',
+          },
+          wait_timeout: {
+            type: "number",
+            description: "等待超时秒数（默认 480）",
+          },
+        },
+        required: ["workflow_id"],
+      },
+      execute: async (args) => {
+        try {
+          const wfId = args.workflow_id as string;
+          const timeout = (args.wait_timeout as number) ?? 480;
+          const result = await workflowRunner.waitForInput(wfId, timeout);
+          return {
+            status: result.status,
+            prompt: result.prompt,
+            output: result.output,
+            error: result.error,
+          };
+        } catch (err) {
+          return { error: `Failed to check status: ${(err as Error).message}` };
         }
       },
     },

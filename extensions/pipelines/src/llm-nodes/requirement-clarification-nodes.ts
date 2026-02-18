@@ -73,6 +73,7 @@ export interface CollectedInfo {
   reportGenerated: boolean;
   requirementDocGenerated: boolean;
   requirementDocContent?: string;
+  requirementDocFilePath?: string;
 }
 
 export function createCollectedInfo(): CollectedInfo {
@@ -141,6 +142,39 @@ export function formatCollectedInfo(info: CollectedInfo): string {
   }
 
   return lines.length > 0 ? lines.join("\n") : "（尚未收集任何信息）";
+}
+
+// ============================================================================
+// Summary Helpers
+// ============================================================================
+
+/** kebab-case 转换 */
+function toKebabCase(s: string): string {
+  return s
+    .replace(/[\s_]+/g, "-")
+    .replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)
+    .replace(/^-/, "")
+    .replace(/-+/g, "-")
+    .toLowerCase();
+}
+
+/** 构建文档摘要 */
+function buildDocSummary(projectName: string, info: CollectedInfo): string {
+  const lines: string[] = [`项目: ${projectName}`];
+  if (info.requirements.core_problem)
+    lines.push(`核心问题: ${info.requirements.core_problem.value}`);
+  if (info.requirements.target_users)
+    lines.push(`目标用户: ${info.requirements.target_users.value}`);
+  const techEntries = Object.entries(info.techChoices);
+  if (techEntries.length > 0) {
+    const techStr = techEntries
+      .map(([k, v]) => `${k}: ${typeof v === "string" ? v : v.choice}`)
+      .join(", ");
+    lines.push(`技术栈: ${techStr}`);
+  }
+  const reqCount = Object.keys(info.requirements).length;
+  lines.push(`需求条目: ${reqCount} 项`);
+  return lines.join("\n");
 }
 
 // ============================================================================
@@ -733,9 +767,11 @@ export function createBuiltinTools(info: CollectedInfo): PipelineAgentTool[] {
       execute: async (args) => {
         const projectName = args.projectName as string;
         const content = generateOpenSpecProposal(projectName, info);
+        const filePath = `docs/proposals/${toKebabCase(projectName)}-proposal.md`;
 
         info.requirementDocGenerated = true;
         info.requirementDocContent = content;
+        info.requirementDocFilePath = filePath;
 
         return {
           generated: true,
@@ -743,6 +779,8 @@ export function createBuiltinTools(info: CollectedInfo): PipelineAgentTool[] {
           projectName,
           sections: ["Why", "What Changes", "Capabilities", "Impact"],
           size: content.length,
+          summary: buildDocSummary(projectName, info),
+          filePath,
         };
       },
     },
@@ -824,6 +862,7 @@ export function createRequirementClarificationNode(deps: RequirementClarificatio
       collectedInfoJson: JSON.stringify(collectedInfo),
       conversationHistory: updatedHistory,
       proposalDocument: collectedInfo.requirementDocContent,
+      proposalFilePath: collectedInfo.requirementDocFilePath,
     };
   };
 }

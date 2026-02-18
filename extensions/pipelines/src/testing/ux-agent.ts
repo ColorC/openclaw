@@ -17,7 +17,7 @@ import type { DevPipelineConfig } from "../chains/chain-dev-pipeline.js";
 import type { ModelProviderConfig } from "../llm/types.js";
 import type { FailureCollector } from "../self-iteration/failure-collector.js";
 import type { KPICollector } from "../self-iteration/kpi-collector.js";
-import { createAgentRunner } from "../llm/agent-adapter.js";
+import { createAgentRunner, type PipelineAgentTool } from "../llm/agent-adapter.js";
 import { ReportBuilder } from "./report-builder.js";
 import { createUxTools, type FinishSignal } from "./ux-tools.js";
 import { WorkflowRunner } from "./workflow-runner.js";
@@ -25,6 +25,9 @@ import { WorkflowRunner } from "./workflow-runner.js";
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Evaluation mode determines what the UX Agent focuses on */
+export type UxEvaluationMode = "e2e" | "process_health" | "full";
 
 export interface UXAgentConfig {
   /** Test task description — tells the UX Agent what to test and how */
@@ -47,6 +50,8 @@ export interface UXAgentConfig {
   reportOutputDir?: string;
   /** Working directory for file/bash tools */
   cwd?: string;
+  /** Evaluation mode: "e2e" (input vs output), "process_health" (process logs), "full" (both) */
+  evaluationMode?: UxEvaluationMode;
 }
 
 export interface UXTestResult {
@@ -67,14 +72,14 @@ export interface UXTestResult {
 }
 
 // ============================================================================
-// System Prompt
+// System Prompts
 // ============================================================================
 
 /**
- * System prompt migrated from Python UXAgentLoopAdapter.get_system_prompt().
+ * Original full system prompt — used for "full" mode and interactive workflow testing.
  * Defines the 3-phase testing flow: Understand → Execute → Report.
  */
-const UX_AGENT_SYSTEM_PROMPT = `# UX Agent — 自动化用户体验测试 Agent
+const UX_AGENT_SYSTEM_PROMPT_FULL = `# UX Agent — 自动化用户体验测试 Agent
 
 ## 角色定义
 你是一个专业的用户体验测试 Agent。你的职责是模拟真实用户与被测系统进行交互，评估系统的易用性、功能完整性和输出质量，最终生成结构化的测试报告。
@@ -166,6 +171,119 @@ const UX_AGENT_SYSTEM_PROMPT = `# UX Agent — 自动化用户体验测试 Agent
 - 如果遇到错误，记录错误信息并继续完成报告
 `;
 
+/**
+ * E2E evaluation system prompt — focuses strictly on input vs output comparison.
+ * No workflow interaction, no "brain-supplementing" requirements.
+ */
+const UX_AGENT_SYSTEM_PROMPT_E2E = `# UX Agent — 端到端输出质量评估
+
+## 角色定义
+你是一个严格的架构设计输出质量评估 Agent。你的职责是对比原始需求和最终输出文档，评估设计质量。
+
+## 核心原则
+1. **严格基于原始需求评价** — 只评价需求中明确提到的功能，绝不"脑补"需求中没有的功能
+2. 不需要启动工作流或进行交互 — 你只需要读取文件并评估
+3. 客观、公正，基于事实
+
+## 评估流程
+
+### Step 1: 理解任务 (1 轮)
+- 仔细阅读任务描述中的原始需求
+- 提取需求中明确列出的功能点作为 checklist
+- 注意：只提取需求中**明确写出**的功能，不要推断隐含功能
+
+### Step 2: 读取输出文件 (1-3 轮)
+- 使用 file_read 读取 design.md、tasks.md、spec.md
+- 如需要可读取 raw-state.json 查看结构化数据
+
+### Step 3: 逐项对照评估 (1-2 轮)
+对照 Step 1 的 checklist，逐项检查：
+- 每个明确需求是否有对应的模块/接口/实体/API 设计
+- 设计是否合理（架构层次、模块职责、接口方向）
+- 输出格式是否完整（design.md 包含所有必需 section）
+
+### Step 4: 填写报告并完成 (1 轮)
+使用 report_builder 填写：
+- requirementCompleteness: 逐项列出需求 checklist 的覆盖情况
+- outputQuality: 设计文档质量评价（结构、一致性、完整性）
+- assessmentLevel: 1-5
+- assessmentReason: 基于事实的评估理由
+然后调用 finish。
+
+## 评估标准
+- 1 = 完美：所有明确需求都有高质量设计覆盖
+- 2 = 优秀：所有明确需求有覆盖，设计有小瑕疵
+- 3 = 可接受：核心需求有覆盖，但设计有明显问题（层次违规、实体重复等）
+- 4 = 不可接受：部分明确需求缺失设计覆盖
+- 5 = 失败：大量需求未覆盖或输出格式严重不合规
+
+## 重要约束
+- **禁止评价需求中没有明确提到的功能缺失** — 例如需求没提"评论系统"，就不能因为缺少评论系统而扣分
+- 不要启动工作流（不使用 run_workflow / respond_input）
+- 最后必须调用 finish
+`;
+
+/**
+ * Process health evaluation system prompt — focuses on workflow execution quality.
+ */
+const UX_AGENT_SYSTEM_PROMPT_PROCESS_HEALTH = `# UX Agent — 过程健康度评估
+
+## 角色定义
+你是一个流水线过程质量评估 Agent。你的职责是分析架构设计流水线的执行过程，评估各节点的健康度。
+
+## 核心原则
+1. 关注过程指标而非最终输出内容
+2. 分析执行日志、中间状态、时间分布
+3. 识别异常模式（超时、重试、空输出、上下文丢失）
+
+## 评估流程
+
+### Step 1: 读取过程数据 (1-2 轮)
+- 读取 raw-state.json 查看中间状态
+- 使用 bash_command / grep_search 搜索 timing 日志
+- 检查 refinement 历史和 validation 结果
+
+### Step 2: 分析过程指标 (1-2 轮)
+评估以下维度：
+- **节点执行时间分布**：是否有异常慢的节点？
+- **错误/重试次数**：是否有节点失败后重试？
+- **上下文传递完整性**：跨域设计时，后续域是否能看到前面域的结果？
+- **Refinement 效果**：如果触发了 refinement，修复了什么问题？
+- **输出完整性**：每个节点是否都产生了非空输出？
+
+### Step 3: 填写报告并完成 (1 轮)
+使用 report_builder 填写：
+- outputQuality: 过程健康度总结
+- suggestions: 过程改进建议
+- assessmentLevel: 1-5（基于过程健康度）
+- assessmentReason: 过程分析结论
+然后调用 finish。
+
+## 评估标准
+- 1 = 完美：所有节点正常执行，无重试，时间合理
+- 2 = 优秀：偶尔重试但自动恢复，时间基本合理
+- 3 = 可接受：有明显的过程问题但最终完成
+- 4 = 不可接受：多次重试、超时、或关键节点输出为空
+- 5 = 失败：流水线中断或关键节点完全失败
+
+## 重要约束
+- 不需要评价设计内容的业务合理性（那是 E2E 评价的职责）
+- 不要启动工作流（不使用 run_workflow / respond_input）
+- 最后必须调用 finish
+`;
+
+function getSystemPrompt(mode: UxEvaluationMode): string {
+  switch (mode) {
+    case "e2e":
+      return UX_AGENT_SYSTEM_PROMPT_E2E;
+    case "process_health":
+      return UX_AGENT_SYSTEM_PROMPT_PROCESS_HEALTH;
+    case "full":
+    default:
+      return UX_AGENT_SYSTEM_PROMPT_FULL;
+  }
+}
+
 // ============================================================================
 // Completion Reminder
 // ============================================================================
@@ -208,6 +326,28 @@ function getCompletionReminder(
 }
 
 // ============================================================================
+// Tool Filtering by Evaluation Mode
+// ============================================================================
+
+/** Tools excluded in E2E mode (no workflow interaction needed) */
+const E2E_EXCLUDED_TOOLS = new Set(["run_workflow", "respond_input", "check_status"]);
+
+/** Filter tools based on evaluation mode */
+function filterToolsByMode(
+  tools: PipelineAgentTool[],
+  mode: UxEvaluationMode,
+): PipelineAgentTool[] {
+  if (mode === "full") return tools;
+
+  if (mode === "e2e" || mode === "process_health") {
+    // Both non-interactive modes exclude workflow interaction tools
+    return tools.filter((t) => !E2E_EXCLUDED_TOOLS.has(t.name));
+  }
+
+  return tools;
+}
+
+// ============================================================================
 // Main Entry
 // ============================================================================
 
@@ -232,6 +372,7 @@ function getCompletionReminder(
 export async function runUxTest(config: UXAgentConfig): Promise<UXTestResult> {
   const maxIterations = config.maxIterations ?? 15;
   const temperature = config.temperature ?? 0.7;
+  const evaluationMode = config.evaluationMode ?? "full";
 
   const runner = createAgentRunner(config.modelConfig);
   const workflowRunner = new WorkflowRunner();
@@ -240,8 +381,8 @@ export async function runUxTest(config: UXAgentConfig): Promise<UXTestResult> {
   // Finish signal — set by the finish tool
   const finishSignal: FinishSignal = { finished: false };
 
-  // Build tool set
-  const tools = createUxTools(
+  // Build tool set and filter by evaluation mode
+  const allTools = createUxTools(
     {
       workflowRunner,
       reportBuilder,
@@ -251,6 +392,9 @@ export async function runUxTest(config: UXAgentConfig): Promise<UXTestResult> {
     },
     finishSignal,
   );
+
+  const tools = filterToolsByMode(allTools, evaluationMode);
+  const systemPrompt = getSystemPrompt(evaluationMode);
 
   // Multi-turn outer loop
   let history: Array<{ role: "user" | "assistant"; content: string }> = [];
@@ -265,7 +409,7 @@ export async function runUxTest(config: UXAgentConfig): Promise<UXTestResult> {
       userMsg = reminder || "继续执行任务。";
     }
 
-    const result = await runner.run(UX_AGENT_SYSTEM_PROMPT, userMsg, tools, {
+    const result = await runner.run(systemPrompt, userMsg, tools, {
       temperature,
       history,
     });

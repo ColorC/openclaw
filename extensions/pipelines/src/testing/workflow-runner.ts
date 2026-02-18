@@ -12,7 +12,10 @@
 
 import type { ChainContext } from "../chains/chain-context.js";
 import type { DevPipelineConfig } from "../chains/chain-dev-pipeline.js";
-import { createDevPipelineGraph } from "../chains/chain-dev-pipeline.js";
+import {
+  createDevPipelineGraph,
+  createLlmDevPipelineConfig,
+} from "../chains/chain-dev-pipeline.js";
 
 // ============================================================================
 // Types
@@ -80,18 +83,22 @@ export class WorkflowRunner {
     this.executions.set(workflowId, execution);
     this.latestId = workflowId;
 
-    // Build interactive config with our onClarificationTurn callback
+    // Build interactive config: auto-generate LLM overrides from ctx if not provided
+    const llmConfig = createLlmDevPipelineConfig(ctx);
     const interactiveConfig: DevPipelineConfig = {
-      ...config,
+      architectureOverrides: config?.architectureOverrides ?? llmConfig.architectureOverrides,
+      coderOverrides: config?.coderOverrides ?? llmConfig.coderOverrides,
       clarification: {
         ...config?.clarification,
         interactive: true,
         onClarificationTurn: async (response: string, isComplete: boolean) => {
           if (isComplete) {
             execution.output.push(response);
-            execution.status = "completed";
-            execution.endTime = Date.now();
-            return null; // Signal completion
+            // Don't set status to "completed" here — the pipeline continues
+            // to architecture design + coder stages. Status will be set to
+            // "completed" by the .then() handler when the full pipeline finishes.
+            execution.status = "running";
+            return null; // Signal clarification completion
           }
 
           // Store agent response and pause
@@ -114,8 +121,20 @@ export class WorkflowRunner {
         userRequirement: userRequirement ?? target,
         scenario: "new_project" as const,
       })
-      .then(() => {
+      .then((result) => {
         if (execution.status !== "error") {
+          // Capture pipeline output (architecture design docs, summary, etc.)
+          if (result.designDocument) {
+            execution.output.push(
+              `\n--- Architecture Design Document ---\n${result.designDocument}`,
+            );
+          }
+          if (result.tasksDocument) {
+            execution.output.push(`\n--- Implementation Tasks ---\n${result.tasksDocument}`);
+          }
+          if (result.summary) {
+            execution.output.push(`\n--- Pipeline Summary ---\n${result.summary}`);
+          }
           execution.status = "completed";
           execution.endTime = Date.now();
         }
@@ -139,9 +158,10 @@ export class WorkflowRunner {
    * Wait for the workflow to request input or complete.
    */
   async waitForInput(workflowId: string, timeout = 60): Promise<WaitResult> {
-    const execution = this.executions.get(workflowId);
+    const resolvedId = this.resolveId(workflowId);
+    const execution = this.executions.get(resolvedId);
     if (!execution) {
-      return { status: "error", error: `Workflow ${workflowId} not found` };
+      return { status: "error", error: `Workflow ${resolvedId} not found` };
     }
 
     // Already waiting or terminal

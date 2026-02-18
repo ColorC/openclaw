@@ -101,6 +101,9 @@ function emptyArchState(
     modules: [],
     interfaces: [],
     responsibilityMatrix: [],
+    entities: [],
+    apiEndpoints: [],
+    domains: [],
     needsRefinement: false,
     refinementIteration: 0,
     refinementHistory: [],
@@ -182,9 +185,9 @@ describe("OpenSpec Document Generators", () => {
     const tasksMd = generateArchitectureTasksMarkdown(state);
 
     // design.md 验证
-    expect(designMd).toContain("# Technical Design Document");
+    expect(designMd).toContain("## Context");
     expect(designMd).toContain("Build a todo list API");
-    expect(designMd).toContain("## Architecture Overview");
+    expect(designMd).toContain("## Decisions");
     expect(designMd).toContain("Layered Architecture");
     expect(designMd).toContain("## Module Design");
     expect(designMd).toContain("API Layer");
@@ -192,17 +195,14 @@ describe("OpenSpec Document Generators", () => {
     expect(designMd).toContain("## Interface Design");
     expect(designMd).toContain("TodoService");
     expect(designMd).toContain("createTodo");
-    expect(designMd).toContain("## Design Review");
-    expect(designMd).toContain("Error handling");
+    expect(designMd).toContain("## Risks / Trade-offs");
 
     // tasks.md 验证
-    expect(tasksMd).toContain("# Implementation Tasks");
-    expect(tasksMd).toContain("- [ ] Create module `mod-api`");
-    expect(tasksMd).toContain("- [ ] Implement `createTodo(CreateTodoInput): Todo`");
-    expect(tasksMd).toContain("## Statistics");
-    expect(tasksMd).toContain("**Modules**: 2");
-    expect(tasksMd).toContain("**Interfaces**: 1");
-    expect(tasksMd).toContain("**Total methods**: 2");
+    expect(tasksMd).toContain("## 1. Module Implementation");
+    expect(tasksMd).toContain("1.1 Create module `mod-api`");
+    expect(tasksMd).toContain("Implement `createTodo(CreateTodoInput): Todo`");
+    expect(tasksMd).toContain("## 2. Interface Definitions");
+    expect(tasksMd).toContain("## 5. Testing & Verification");
 
     console.log("✅ design.md length:", designMd.length, "chars");
     console.log("✅ tasks.md length:", tasksMd.length, "chars");
@@ -214,10 +214,10 @@ describe("OpenSpec Document Generators", () => {
     const designMd = generateDesignMarkdown(state);
     const tasksMd = generateArchitectureTasksMarkdown(state);
 
-    expect(designMd).toContain("# Technical Design Document");
+    expect(designMd).toContain("## Context");
     expect(designMd).toContain("Empty project");
-    expect(tasksMd).toContain("# Implementation Tasks");
-    expect(tasksMd).toContain("**Modules**: 0");
+    expect(tasksMd).toContain("## 1. Module Implementation");
+    expect(tasksMd).toContain("_No modules to implement_");
   });
 });
 
@@ -337,12 +337,12 @@ describe.skipIf(!hasApiKey)(
       expect(tasksMd!.length).toBeGreaterThan(50);
 
       // 验证 design.md 包含关键章节
-      expect(designMd).toContain("# Technical Design Document");
+      expect(designMd).toContain("## Context");
       expect(designMd).toContain("## Module Design");
       expect(designMd).toContain("## Interface Design");
 
       // 验证 tasks.md 包含任务
-      expect(tasksMd).toContain("# Implementation Tasks");
+      expect(tasksMd).toContain("## 1. Module Implementation");
       expect(tasksMd).toContain("- [ ]");
 
       console.log("✅ OpenSpec documents generated successfully");
@@ -371,11 +371,31 @@ describe.skipIf(!hasApiKey)(
         llmExecutor: clarificationNode,
       });
 
-      const result = await graph.invoke({
-        messages: [{ content: "A hello world program with a greeting function" }],
-        iteration: 0,
-        completed: false,
-      });
+      // Multi-turn loop: feed auto-responses until agent completes
+      const autoResponses = [
+        "A hello world program with a greeting function",
+        "Target users: developers learning a new language. Use Python. The program should print a greeting message. No special requirements, just a simple CLI app.",
+        "Yes, that's all. Please generate the requirement document now.",
+        "Yes, generate the document.",
+      ];
+
+      let result: any = null;
+      for (let turn = 0; turn < autoResponses.length; turn++) {
+        const input: any = {
+          messages: [{ content: autoResponses[turn] }],
+          iteration: result?.iteration ?? 0,
+          completed: false,
+          collectedInfoJson: result?.collectedInfoJson ?? "{}",
+          conversationHistory: result?.conversationHistory ?? [],
+        };
+        result = await graph.invoke(input);
+
+        console.log(
+          `  Turn ${turn + 1}: completed=${result.completed}, iteration=${result.iteration}`,
+        );
+
+        if (result.completed) break;
+      }
 
       // 验证 agent 完成了需求文档生成
       expect(result.completed).toBe(true);
@@ -390,7 +410,7 @@ describe.skipIf(!hasApiKey)(
       console.log("  - Response length:", result.response!.length, "chars");
       console.log("  - Iterations:", result.iteration);
       console.log("  - Response preview:", result.response!.slice(0, 200));
-    }, 180000); // 3min timeout
+    }, 300000); // 5min timeout for multi-turn
 
     // ========================================================================
     // Test 3: 完整三阶段管线 (opt-in)

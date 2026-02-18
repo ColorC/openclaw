@@ -63,6 +63,10 @@ export const RequirementClarificationAnnotation = Annotation.Root({
   proposalDocument: Annotation<string | undefined>({
     default: () => undefined,
   }),
+  /** 生成的 proposal 文件建议路径 */
+  proposalFilePath: Annotation<string | undefined>({
+    default: () => undefined,
+  }),
 });
 
 export type RequirementClarificationGraphState = typeof RequirementClarificationAnnotation.State;
@@ -202,5 +206,6 @@ export async function clarifyRequirements(
     collectedInfoJson: result.collectedInfoJson,
     conversationHistory: result.conversationHistory,
     proposalDocument: result.proposalDocument,
+    proposalFilePath: result.proposalFilePath,
   };
 }

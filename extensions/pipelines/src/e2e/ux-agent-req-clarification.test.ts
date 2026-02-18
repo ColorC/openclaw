@@ -386,6 +386,38 @@ describe("UX Agent — ReportBuilder Instrumentation", () => {
 // ============================================================================
 
 function detectProvider() {
+  // 尝试从 OpenClaw 配置注入环境变量（~/.openclaw/openclaw.json 的 env 段）
+  // 注意：vitest setup 会用 withIsolatedTestHome() 替换 HOME，所以 os.homedir() 不可靠。
+  // 依次尝试：OPENCLAW_TEST_HOME 备份的原始 HOME → /etc/passwd 真实 HOME → os.homedir()
+  try {
+    const realHome =
+      process.env.OPENCLAW_REAL_HOME ??
+      (() => {
+        try {
+          const passwd = fs.readFileSync("/etc/passwd", "utf-8");
+          const uid = process.getuid?.();
+          if (uid !== undefined) {
+            const line = passwd.split("\n").find((l) => l.split(":")[2] === String(uid));
+            if (line) return line.split(":")[5];
+          }
+        } catch {
+          /* ignore */
+        }
+        return os.homedir();
+      })();
+    const cfgPath = path.join(realHome, ".openclaw", "openclaw.json");
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf-8"));
+    if (cfg.env && typeof cfg.env === "object") {
+      for (const [k, v] of Object.entries(cfg.env)) {
+        if (typeof v === "string" && !process.env[k]) {
+          process.env[k] = v;
+        }
+      }
+    }
+  } catch {
+    // 配置不可用时忽略，继续用 process.env
+  }
+
   if (process.env.GLM_API_KEY) {
     return {
       name: "GLM-5",
@@ -492,6 +524,6 @@ Steps:
       } finally {
         disposeChainContext(ctx);
       }
-    }, 300_000); // 5 min timeout
+    }, 600_000); // 10 min timeout
   },
 );

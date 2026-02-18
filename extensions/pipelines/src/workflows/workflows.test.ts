@@ -195,7 +195,7 @@ describe("Coder", () => {
         codeContext: { requirements: "Quick sort" },
       });
       expect(result.success).toBe(true);
-      expect(result.implementationCode).toBeDefined();
+      expect(result.implementationSummary).toBeDefined();
       expect(result.iterationCount).toBe(1);
     });
 
@@ -208,7 +208,7 @@ describe("Coder", () => {
           errorReports: [{ file: "foo.ts", message: "Type error", type: "compile" as const }],
         },
       });
-      expect(result.fixedCode).toBeDefined();
+      expect(result.fixSummary).toBeDefined();
     });
   });
 
