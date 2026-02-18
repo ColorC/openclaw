@@ -15,10 +15,14 @@ export {
   createAnalyzeRequirementNode,
   createListFeaturesNode,
   createSelectPatternNode,
+  createDesignDomainsNode,
   createDesignModulesNode,
   createDefineInterfacesNode,
+  createDesignDataModelNode,
+  createDesignApiEndpointsNode,
   createDesignReviewNode,
   createValidateArchitectureNode,
+  createRefineDesignNode,
   createDesignFileStructureNode,
   createGenerateOpenspecNode,
 } from "./architecture-nodes.js";
@@ -28,6 +32,14 @@ export type { ArchitectureNodeDeps } from "./architecture-nodes.js";
 export { createRecursiveCoderNode, createHandleArgueNode } from "./coder-nodes.js";
 export type { CoderNodeDeps } from "./coder-nodes.js";
 
+// Native Coder node (pi-coding-agent tools + Agent Runner)
+export { createNativeCoderNode } from "./native-coder-node.js";
+export type { NativeCoderNodeDeps } from "./native-coder-node.js";
+
+// Claude Code CLI Coder node
+export { createClaudeCodeCoderNode } from "./claude-code-coder-node.js";
+export type { ClaudeCodeCoderNodeDeps } from "./claude-code-coder-node.js";
+
 // Requirement Clarification nodes
 export { createRequirementClarificationNode } from "./requirement-clarification-nodes.js";
 export type { RequirementClarificationNodeDeps } from "./requirement-clarification-nodes.js";
@@ -36,4 +48,5 @@ export type { RequirementClarificationNodeDeps } from "./requirement-clarificati
 export {
   generateDesignMarkdown,
   generateArchitectureTasksMarkdown,
+  generateSpecMarkdown,
 } from "./openspec-generators.js";

@@ -33,8 +33,8 @@ export const CoderAnnotation = Annotation.Root({
   retryReason: Annotation<string | undefined>({ default: () => undefined }),
   toolsUsed: Annotation<string[]>({ default: () => [] }),
   // 输出
-  implementationCode: Annotation<string | undefined>({ default: () => undefined }),
-  fixedCode: Annotation<string | undefined>({ default: () => undefined }),
+  implementationSummary: Annotation<string | undefined>({ default: () => undefined }),
+  fixSummary: Annotation<string | undefined>({ default: () => undefined }),
   modifiedFiles: Annotation<string[]>({ default: () => [] }),
   success: Annotation<boolean>({ default: () => false }),
   error: Annotation<string | undefined>({ default: () => undefined }),
@@ -113,8 +113,8 @@ const defaultNodes: Required<CoderNodeOverrides> = {
   async finalize(state) {
     const hasErrors = state.codeContext.errorReports?.length;
     return {
-      implementationCode: !hasErrors ? state.currentCode : undefined,
-      fixedCode: hasErrors ? state.currentCode : undefined,
+      implementationSummary: !hasErrors ? state.currentCode : undefined,
+      fixSummary: hasErrors ? state.currentCode : undefined,
       success: state.validationResult?.passed ?? false,
     };
   },

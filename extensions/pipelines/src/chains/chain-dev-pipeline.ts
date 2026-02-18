@@ -20,15 +20,23 @@ import {
   createAnalyzeRequirementNode,
   createListFeaturesNode,
   createSelectPatternNode,
+  createDesignDomainsNode,
   createDesignModulesNode,
   createDefineInterfacesNode,
+  createDesignDataModelNode,
+  createDesignApiEndpointsNode,
   createDesignReviewNode,
   createValidateArchitectureNode,
+  createRefineDesignNode,
   createDesignFileStructureNode,
   createGenerateOpenspecNode,
   createRecursiveCoderNode,
   createHandleArgueNode,
 } from "../llm-nodes/index.js";
+import {
+  createPipelineWebSearchTool,
+  createPipelineWebFetchTool,
+} from "../llm/web-tools-adapter.js";
 import { PromptRegistry } from "../prompts/prompt-registry.js";
 import { createArchitectureDesignGraph } from "../workflows/architecture-design.js";
 import { createCoderGraph } from "../workflows/coder.js";
@@ -110,10 +118,14 @@ export function createLlmDevPipelineConfig(ctx: ChainContext): DevPipelineConfig
       analyzeRequirement: createAnalyzeRequirementNode(deps),
       listFeatures: createListFeaturesNode(deps),
       selectPattern: createSelectPatternNode(deps),
+      designDomains: createDesignDomainsNode(deps),
       designModules: createDesignModulesNode(deps),
       defineInterfaces: createDefineInterfacesNode(deps),
+      designDataModel: createDesignDataModelNode(deps),
+      designApiEndpoints: createDesignApiEndpointsNode(deps),
       designReview: createDesignReviewNode(deps),
       validateArchitecture: createValidateArchitectureNode(deps),
+      refineDesign: createRefineDesignNode(deps),
       designFileStructure: createDesignFileStructureNode(deps),
       generateOpenspec: createGenerateOpenspecNode(deps),
     },
@@ -146,12 +158,15 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
       const clarificationDeps: RequirementClarificationNodeDeps = {
         modelProviderConfig,
         promptRegistry,
-        ...(config.clarification?.tools?.find((t) => t.name === "quick_web_search")
-          ? { webSearchTool: config.clarification.tools.find((t) => t.name === "quick_web_search") }
-          : {}),
-        ...(config.clarification?.tools?.find((t) => t.name === "quick_web_fetch")
-          ? { webFetchTool: config.clarification.tools.find((t) => t.name === "quick_web_fetch") }
-          : {}),
+        // Web tools: 优先使用显式传入的，否则自动从 OpenClaw 创建（需要 BRAVE_API_KEY 等环境变量）
+        webSearchTool:
+          config.clarification?.tools?.find((t) => t.name === "quick_web_search") ??
+          createPipelineWebSearchTool() ??
+          undefined,
+        webFetchTool:
+          config.clarification?.tools?.find((t) => t.name === "quick_web_fetch") ??
+          createPipelineWebFetchTool() ??
+          undefined,
       };
 
       const clarificationNode = createRequirementClarificationNode(clarificationDeps);
@@ -181,6 +196,8 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
           const response = result.response ?? "";
 
           if (isComplete) {
+            // 通知回调：交互完成，传递最终文档
+            await onTurn(result.proposalDocument ?? response, true);
             return {
               clarifiedRequirement: result.proposalDocument ?? response,
               proposalDocument: result.proposalDocument,
