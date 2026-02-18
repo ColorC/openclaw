@@ -1,8 +1,14 @@
 /**
  * Agent 框架集成适配器
  *
- * 桥接 Pipeline 的 ModelProvider 与 @mariozechner/pi-agent-core 的 agentLoop。
- * 让工作流节点（如需求澄清）能复用 OpenClaw 已有的 agent 循环能力。
+ * 完全复用 OpenClaw 的核心 agent 能力:
+ * - agentLoop: 核心事件驱动的 agent 循环
+ * - SessionManager: 会话持久化、历史管理
+ * - SettingsManager: 压缩配置、context pruning
+ * - estimateTokens: token 估算
+ * - compact: 会话压缩
+ *
+ * 桥接 Pipeline 的 ModelProvider 与 @mariozechner/pi-agent-core。
  */
 
 import type {
@@ -16,7 +22,19 @@ import type { AssistantMessage, Model, Message } from "@mariozechner/pi-ai";
 import type { TSchema } from "@sinclair/typebox";
 import { agentLoop } from "@mariozechner/pi-agent-core";
 import { streamSimple } from "@mariozechner/pi-ai";
+import {
+  SessionManager,
+  SettingsManager,
+  estimateTokens,
+  shouldCompact,
+  generateSummary,
+  DEFAULT_COMPACTION_SETTINGS,
+  type CompactionSettings,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ModelProviderConfig } from "./types.js";
 
 // ============================================================================
@@ -44,6 +62,12 @@ export interface AgentLoopResult {
   finalResponse: string;
   /** 所有工具调用记录 */
   toolCalls: Array<{ name: string; args: unknown; result: unknown }>;
+  /** 会话 ID（用于跨轮次持久化） */
+  sessionId: string;
+  /** 会话文件路径 */
+  sessionFile: string;
+  /** 估算的 token 数量 */
+  estimatedTokens?: number;
 }
 
 /**
@@ -53,8 +77,28 @@ export interface AgentRunOptions {
   temperature?: number;
   maxTokens?: number;
   signal?: AbortSignal;
-  /** 对话历史 — 预填充到 agentLoop context.messages，支持多轮交互 */
+  /** 对话历史 — 预填充到 context，支持多轮交互 */
   history?: Array<{ role: "user" | "assistant"; content: string }>;
+  /** 会话 ID（用于跨轮次持久化，不传则创建新会话） */
+  sessionId?: string;
+  /** 会话存储目录（默认为系统临时目录） */
+  sessionDir?: string;
+  /** 工作目录（用于 SettingsManager） */
+  cwd?: string;
+  /** 是否启用自动压缩（当接近 context window 时） */
+  autoCompact?: boolean;
+}
+
+/**
+ * Agent Runner 配置
+ */
+export interface AgentRunnerConfig extends ModelProviderConfig {
+  /** 会话存储目录 */
+  sessionDir?: string;
+  /** 工作目录 */
+  cwd?: string;
+  /** 默认压缩配置 */
+  compactionSettings?: Partial<CompactionSettings>;
 }
 
 // ============================================================================
@@ -133,11 +177,68 @@ function convertToLlm(messages: AgentMessage[]): Message[] {
 }
 
 // ============================================================================
-// Agent Runner
+// Session Manager Helper
 // ============================================================================
 
 /**
- * 创建 agent 循环运行器
+ * 获取或创建 SessionManager
+ */
+async function getOrCreateSessionManager(
+  sessionDir: string,
+  sessionId: string,
+): Promise<{ sessionManager: SessionManager; sessionFile: string }> {
+  await fs.mkdir(sessionDir, { recursive: true });
+  const sessionFile = path.join(sessionDir, `${sessionId}.jsonl`);
+
+  // 确保文件存在
+  try {
+    await fs.access(sessionFile);
+  } catch {
+    await fs.writeFile(sessionFile, "", "utf-8");
+  }
+
+  const sessionManager = SessionManager.open(sessionFile);
+  return { sessionManager, sessionFile };
+}
+
+/**
+ * 估算消息列表的 token 数量
+ */
+function estimateMessagesTokens(messages: AgentMessage[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    try {
+      total += estimateTokens(msg);
+    } catch {
+      // 如果估算失败，使用字符数作为后备
+      const content = (msg as { content?: unknown }).content;
+      if (typeof content === "string") {
+        total += Math.ceil(content.length / 4);
+      } else if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && typeof block === "object" && "text" in block) {
+            total += Math.ceil(String((block as { text: string }).text).length / 4);
+          }
+        }
+      }
+    }
+  }
+  return total;
+}
+
+// ============================================================================
+// Agent Runner (Full OpenClaw Integration)
+// ============================================================================
+
+/**
+ * 创建 agent 运行器（完全复用 OpenClaw 核心能力）
+ *
+ * 使用 agentLoop + SessionManager + SettingsManager，
+ * 自动获得:
+ * - 会话持久化
+ * - Context window 管理
+ * - 手动/自动压缩（compaction）
+ * - Token 估算
  *
  * @example
  * ```typescript
@@ -148,15 +249,26 @@ function convertToLlm(messages: AgentMessage[]): Message[] {
  *   [recordRequirementTool, webSearchTool],
  * )
  * console.log(result.finalResponse)
+ * // 下一轮可以传入相同的 sessionId 继续对话
+ * const result2 = await runner.run(
+ *   'You are a requirement analyst.',
+ *   'More details about the project...',
+ *   tools,
+ *   { sessionId: result.sessionId }
+ * )
  * ```
  */
-export function createAgentRunner(config: ModelProviderConfig) {
+export function createAgentRunner(config: AgentRunnerConfig) {
   const model = createModelFromConfig(config);
   const apiKey = config.apiKey;
+  const defaultSessionDir = config.sessionDir ?? path.join(os.tmpdir(), "pipelines-sessions");
+  const cwd = config.cwd ?? process.cwd();
 
   return {
     /**
      * 执行一次完整的 agent 循环
+     *
+     * 使用 agentLoop + SessionManager 实现完整的会话管理
      */
     async run(
       systemPrompt: string,
@@ -164,6 +276,11 @@ export function createAgentRunner(config: ModelProviderConfig) {
       tools: PipelineAgentTool[],
       options?: AgentRunOptions,
     ): Promise<AgentLoopResult> {
+      const sessionId =
+        options?.sessionId ?? `pipeline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const sessionDir = options?.sessionDir ?? defaultSessionDir;
+      const effectiveCwd = options?.cwd ?? cwd;
+
       const agentTools = tools.map(adaptTool);
       const toolCallRecords: Array<{ name: string; args: unknown; result: unknown }> = [];
 
@@ -171,23 +288,71 @@ export function createAgentRunner(config: ModelProviderConfig) {
       const trackedTools: AgentTool<TSchema, unknown>[] = agentTools.map((t) => ({
         ...t,
         execute: async (toolCallId, params, signal, onUpdate) => {
+          console.log(`[agent] 🔧 Tool call: ${t.name}(${JSON.stringify(params).slice(0, 200)})`);
           const result = await t.execute(toolCallId, params, signal, onUpdate);
           toolCallRecords.push({
             name: t.name,
             args: params,
             result: result.details,
           });
+          const resultPreview =
+            typeof result.details === "string"
+              ? result.details.slice(0, 150)
+              : JSON.stringify(result.details).slice(0, 150);
+          console.log(`[agent]    ↳ ${t.name} ✅ → ${resultPreview}`);
           return result;
         },
       }));
 
+      // 获取或创建 SessionManager
+      const { sessionManager, sessionFile } = await getOrCreateSessionManager(
+        sessionDir,
+        sessionId,
+      );
+
+      // 创建 SettingsManager（用于压缩配置）
+      const settingsManager = SettingsManager.create(effectiveCwd, effectiveCwd);
+
+      // 从 session 加载历史消息
+      const sessionContext = sessionManager.buildSessionContext();
+      let contextMessages = sessionContext.messages;
+
+      // 如果有 history 选项，转换为 AgentMessage 格式
+      if (options?.history && options.history.length > 0) {
+        const historyMessages: AgentMessage[] = options.history.map((h) => {
+          if (h.role === "assistant") {
+            return {
+              role: "assistant" as const,
+              content: [{ type: "text" as const, text: h.content }],
+              api: model.api,
+              provider: model.provider,
+              model: model.id,
+              usage: {
+                input: 0,
+                output: 0,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 0,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              },
+              stopReason: "stop" as const,
+              timestamp: Date.now(),
+            };
+          }
+          return {
+            role: "user" as const,
+            content: h.content,
+            timestamp: Date.now(),
+          };
+        });
+        // 合并历史和 session 消息
+        contextMessages = [...historyMessages, ...contextMessages];
+      }
+
+      // 构建 AgentContext
       const context: AgentContext = {
         systemPrompt,
-        messages: (options?.history ?? []).map((h) => ({
-          role: h.role as "user" | "assistant",
-          content: h.content,
-          timestamp: Date.now(),
-        })),
+        messages: contextMessages,
         tools: trackedTools,
       };
 
@@ -205,46 +370,55 @@ export function createAgentRunner(config: ModelProviderConfig) {
         timestamp: Date.now(),
       };
 
+      console.log("[agent] 🚀 Agent loop started");
+
+      // 执行 agent 循环
       const eventStream = agentLoop([prompt], context, loopConfig, options?.signal, streamSimple);
 
-      // 消费事件流，打印 agent 行为日志
-      for await (const event of eventStream) {
-        if (event.type === "agent_start") {
-          console.log("[agent] 🚀 Agent loop started");
-        } else if (event.type === "turn_start") {
-          console.log("[agent] ── turn start ──");
-        } else if (event.type === "tool_execution_start") {
-          console.log(
-            `[agent] 🔧 Tool call: ${event.toolName}(${JSON.stringify(event.args).slice(0, 200)})`,
-          );
-        } else if (event.type === "tool_execution_end") {
-          const resultPreview =
-            typeof event.result === "string"
-              ? event.result.slice(0, 150)
-              : JSON.stringify(event.result).slice(0, 150);
-          console.log(
-            `[agent]    ↳ ${event.toolName} ${event.isError ? "❌" : "✅"} → ${resultPreview}`,
-          );
-        } else if (event.type === "message_end") {
-          const msg = event.message as AssistantMessage;
-          if (msg.role === "assistant" && msg.content) {
-            const textParts = msg.content
-              .filter((c): c is { type: "text"; text: string } => c.type === "text")
-              .map((c) => c.text)
-              .join("");
-            if (textParts) {
-              console.log(
-                `[agent] 💬 Assistant: ${textParts.slice(0, 200)}${textParts.length > 200 ? "..." : ""}`,
-              );
+      // 消费事件流（may be aborted early via signal）
+      let allMessages: AgentMessage[] = [];
+      let aborted = false;
+      try {
+        for await (const event of eventStream) {
+          if (event.type === "turn_start") {
+            console.log("[agent] ── turn start ──");
+          } else if (event.type === "message_end") {
+            const msg = event.message as AssistantMessage;
+            if (msg.role === "assistant" && msg.content) {
+              const textParts = (Array.isArray(msg.content) ? msg.content : [])
+                .filter((c): c is { type: "text"; text: string } => c.type === "text")
+                .map((c) => c.text)
+                .join("");
+              if (textParts) {
+                console.log(
+                  `[agent] 💬 Assistant: ${textParts.slice(0, 200)}${textParts.length > 200 ? "..." : ""}`,
+                );
+              }
             }
+          } else if (event.type === "agent_end") {
+            console.log("[agent] 🏁 Agent loop ended");
           }
-        } else if (event.type === "agent_end") {
-          console.log("[agent] 🏁 Agent loop ended");
+        }
+
+        // 获取最终消息
+        allMessages = await eventStream.result();
+      } catch (err) {
+        // Handle abort gracefully — still return collected tool calls
+        if (options?.signal?.aborted) {
+          console.log("[agent] 🛑 Agent loop aborted (task_complete signal)");
+          aborted = true;
+          try {
+            allMessages = await eventStream.result();
+          } catch {
+            // result() may also throw on abort — use empty array
+          }
+        } else {
+          throw err;
         }
       }
 
-      // 获取最终消息
-      const allMessages = await eventStream.result();
+      // 估算 token 数量
+      const estimatedTokens = estimateMessagesTokens(allMessages);
 
       // 提取最后一条 assistant 消息的文本内容
       const lastAssistant = [...allMessages]
@@ -260,11 +434,129 @@ export function createAgentRunner(config: ModelProviderConfig) {
           .map((c) => c.text)
           .join("") ?? "";
 
+      // 持久化消息到 session（skip if aborted with no messages）
+      if (allMessages.length > 0) {
+        for (const msg of allMessages) {
+          if (
+            (msg as { role?: string }).role === "user" ||
+            (msg as { role?: string }).role === "assistant"
+          ) {
+            sessionManager.appendMessage(msg as Message);
+          }
+        }
+        console.log("[agent] 📝 Session saved");
+      } else if (aborted) {
+        console.log("[agent] 📝 Session save skipped (aborted)");
+      }
+
       return {
         messages: allMessages,
         finalResponse,
         toolCalls: toolCallRecords,
+        sessionId,
+        sessionFile,
+        estimatedTokens,
       };
+    },
+
+    /**
+     * 压缩会话（调用 LLM 生成摘要）
+     *
+     * 当会话过长时，调用此方法进行压缩
+     */
+    async compact(
+      sessionId: string,
+      options?: { sessionDir?: string; customInstructions?: string },
+    ): Promise<{
+      success: boolean;
+      tokensBefore?: number;
+      tokensAfter?: number;
+      summary?: string;
+    }> {
+      const sessionDir = options?.sessionDir ?? defaultSessionDir;
+      const { sessionManager } = await getOrCreateSessionManager(sessionDir, sessionId);
+
+      try {
+        const sessionContext = sessionManager.buildSessionContext();
+        const messages = sessionContext.messages;
+        const tokensBefore = estimateMessagesTokens(messages);
+
+        const settings = config.compactionSettings
+          ? { ...DEFAULT_COMPACTION_SETTINGS, ...config.compactionSettings }
+          : DEFAULT_COMPACTION_SETTINGS;
+
+        if (!shouldCompact(tokensBefore, model.contextWindow, settings)) {
+          console.log("[agent] ℹ️ Session does not need compaction yet");
+          return { success: true, tokensBefore, tokensAfter: tokensBefore };
+        }
+
+        console.log(`[agent] 🗜️ Compacting session (tokens before: ${tokensBefore})`);
+
+        const resolvedApiKey = apiKey ?? "";
+        const summary = await generateSummary(
+          messages,
+          model as any,
+          settings.reserveTokens,
+          resolvedApiKey,
+          undefined,
+          options?.customInstructions,
+        );
+
+        // 持久化压缩摘要到 session
+        const leafEntry = sessionManager.getLeafEntry();
+        if (leafEntry) {
+          sessionManager.appendCompaction(summary, leafEntry.id, tokensBefore);
+        }
+
+        const afterContext = sessionManager.buildSessionContext();
+        const tokensAfter = estimateMessagesTokens(afterContext.messages);
+
+        console.log(`[agent] ✅ Compaction complete (tokens after: ${tokensAfter})`);
+
+        return {
+          success: true,
+          tokensBefore,
+          tokensAfter,
+          summary,
+        };
+      } catch (err) {
+        console.error("[agent] Compaction failed:", err);
+        return { success: false };
+      }
+    },
+
+    /**
+     * 获取会话中的消息列表
+     */
+    async getMessages(
+      sessionId: string,
+      options?: { sessionDir?: string },
+    ): Promise<AgentMessage[]> {
+      const sessionDir = options?.sessionDir ?? defaultSessionDir;
+      const { sessionManager } = await getOrCreateSessionManager(sessionDir, sessionId);
+      return sessionManager.buildSessionContext().messages;
+    },
+
+    /**
+     * 获取会话的估算 token 数量
+     */
+    async getTokenCount(sessionId: string, options?: { sessionDir?: string }): Promise<number> {
+      const sessionDir = options?.sessionDir ?? defaultSessionDir;
+      const { sessionManager } = await getOrCreateSessionManager(sessionDir, sessionId);
+      return estimateMessagesTokens(sessionManager.buildSessionContext().messages);
+    },
+
+    /**
+     * 删除会话
+     */
+    async deleteSession(sessionId: string, options?: { sessionDir?: string }): Promise<void> {
+      const sessionDir = options?.sessionDir ?? defaultSessionDir;
+      const sessionFile = path.join(sessionDir, `${sessionId}.jsonl`);
+      try {
+        await fs.unlink(sessionFile);
+      } catch {
+        // 忽略文件不存在的错误
+      }
     },
   };
 }

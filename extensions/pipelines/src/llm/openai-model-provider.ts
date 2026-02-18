@@ -25,6 +25,10 @@ export interface OpenAIModelProviderConfig extends ModelProviderConfig {
   baseUrl?: string;
   /** Organization ID */
   organization?: string;
+  /** Request timeout in ms (default: 600_000 = 10 min) */
+  timeout?: number;
+  /** Max retries on transient errors (default: 3) */
+  maxRetries?: number;
 }
 
 export class OpenAIModelProvider implements ModelProvider {
@@ -37,6 +41,8 @@ export class OpenAIModelProvider implements ModelProvider {
       apiKey: config.apiKey ?? process.env.OPENAI_API_KEY,
       baseURL: config.baseUrl,
       organization: config.organization,
+      timeout: config.timeout ?? 600_000, // 10 min per request
+      maxRetries: config.maxRetries ?? 2,
     });
   }
 
@@ -87,7 +93,23 @@ export class OpenAIModelProvider implements ModelProvider {
         toolCalls: message.tool_calls.map((tc) => ({
           id: tc.id,
           name: tc.function.name,
-          arguments: JSON.parse(tc.function.arguments),
+          arguments: (() => {
+            try {
+              return JSON.parse(tc.function.arguments);
+            } catch {
+              // LLM returned malformed JSON — attempt to salvage
+              console.warn(
+                `[model-provider] Malformed tool call JSON for ${tc.function.name}, attempting repair`,
+              );
+              try {
+                // Common fix: trailing garbage after closing brace
+                const trimmed = tc.function.arguments.replace(/\}[^}]*$/, "}");
+                return JSON.parse(trimmed);
+              } catch {
+                return { _raw: tc.function.arguments, _parseError: true };
+              }
+            }
+          })(),
         })),
         usage: response.usage
           ? {
