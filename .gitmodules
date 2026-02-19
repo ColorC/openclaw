@@ -1,0 +1,6 @@
+[submodule "vendor/openhands"]
+	path = vendor/openhands
+	url = https://github.com/ColorC/OpenHands-ToyShop.git
+[submodule "vendor/openspec"]
+	path = vendor/openspec
+	url = https://github.com/ColorC/OpenSpec-ToyShop.git
