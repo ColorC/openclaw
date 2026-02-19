@@ -12,8 +12,10 @@
 import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
 import type { RequirementClarificationNodeDeps } from "../llm-nodes/requirement-clarification-nodes.js";
 import type { PipelineAgentTool } from "../llm/agent-adapter.js";
+import type { IncrementalDB } from "../pm/incremental-db.js";
 import type { ArchitectureDesignNodeOverrides } from "../workflows/architecture-design.js";
 import type { CoderNodeOverrides } from "../workflows/coder.js";
+import type { ArchitectureSnapshot } from "../workflows/states.js";
 import type { ChainContext } from "./chain-context.js";
 import {
   createRequirementClarificationNode,
@@ -32,11 +34,15 @@ import {
   createGenerateOpenspecNode,
   createRecursiveCoderNode,
   createHandleArgueNode,
+  createLoadExistingContextNode,
+  createAnalyzeChangeImpactNode,
+  createDesignDeltaNode,
 } from "../llm-nodes/index.js";
 import {
   createPipelineWebSearchTool,
   createPipelineWebFetchTool,
 } from "../llm/web-tools-adapter.js";
+import { IncrementalDB as IncrementalDBClass } from "../pm/incremental-db.js";
 import { PromptRegistry } from "../prompts/prompt-registry.js";
 import { createArchitectureDesignGraph } from "../workflows/architecture-design.js";
 import { createCoderGraph } from "../workflows/coder.js";
@@ -51,6 +57,10 @@ export const DevPipelineAnnotation = Annotation.Root({
   userRequirement: Annotation<string>({ default: () => "" }),
   scenario: Annotation<"new_project" | "modify_existing">({ default: () => "new_project" }),
   projectPath: Annotation<string | undefined>({ default: () => undefined }),
+
+  // 增量修改上下文
+  projectId: Annotation<string | undefined>({ default: () => undefined }),
+  changeRecordId: Annotation<number | undefined>({ default: () => undefined }),
 
   // Stage 1: Requirement Clarification 输出
   clarifiedRequirement: Annotation<string>({ default: () => "" }),
@@ -101,17 +111,27 @@ export interface DevPipelineConfig {
   architectureOverrides?: ArchitectureDesignNodeOverrides;
   /** Coder 节点覆写 */
   coderOverrides?: CoderNodeOverrides;
+  /** 增量模式数据库（modify_existing 场景必需） */
+  db?: IncrementalDB;
 }
 
 /**
  * 从 ChainContext 生成 LLM 驱动的 DevPipelineConfig
+ * @param ctx Chain context with model provider and prompt registry
+ * @param db Optional incremental database for modify_existing scenario
  */
-export function createLlmDevPipelineConfig(ctx: ChainContext): DevPipelineConfig {
+export function createLlmDevPipelineConfig(
+  ctx: ChainContext,
+  db?: IncrementalDB,
+): DevPipelineConfig {
   if (!ctx.modelProvider || !ctx.promptRegistry) {
     return {};
   }
 
   const deps = { modelProvider: ctx.modelProvider, promptRegistry: ctx.promptRegistry };
+
+  // Incremental nodes only created when db is available
+  const incrementalDeps = db ? { ...deps, db } : undefined;
 
   return {
     architectureOverrides: {
@@ -128,11 +148,19 @@ export function createLlmDevPipelineConfig(ctx: ChainContext): DevPipelineConfig
       refineDesign: createRefineDesignNode(deps),
       designFileStructure: createDesignFileStructureNode(deps),
       generateOpenspec: createGenerateOpenspecNode(deps),
+      // Incremental nodes for modify_existing scenario
+      ...(incrementalDeps && {
+        loadExistingContext: createLoadExistingContextNode(incrementalDeps),
+        analyzeChangeImpact: createAnalyzeChangeImpactNode(incrementalDeps),
+        designDelta: createDesignDeltaNode(incrementalDeps),
+      }),
     },
     coderOverrides: {
       recursiveCoder: createRecursiveCoderNode(deps),
       handleArgue: createHandleArgueNode(deps),
     },
+    // Pass db through for nodes that need direct access
+    ...(db && { db }),
   };
 }
 
@@ -155,6 +183,15 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
       const modelProviderConfig = (ctx.modelProvider as any).config ?? {};
       const promptRegistry = ctx.promptRegistry ?? new PromptRegistry();
 
+      // 增量模式：从数据库加载现有需求
+      let existingRequirements = undefined;
+      if (state.scenario === "modify_existing" && config.db && state.projectId) {
+        const snapshot = config.db.getLatestSnapshot(state.projectId, "requirement");
+        if (snapshot?.requirementSummary) {
+          existingRequirements = snapshot.requirementSummary;
+        }
+      }
+
       const clarificationDeps: RequirementClarificationNodeDeps = {
         modelProviderConfig,
         promptRegistry,
@@ -167,6 +204,9 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
           config.clarification?.tools?.find((t) => t.name === "quick_web_fetch") ??
           createPipelineWebFetchTool() ??
           undefined,
+        // 增量模式上下文
+        existingRequirements,
+        scenario: state.scenario,
       };
 
       const clarificationNode = createRequirementClarificationNode(clarificationDeps);
@@ -256,6 +296,9 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
         requirement,
         scenario: state.scenario,
         projectPath: state.projectPath,
+        // Incremental context for modify_existing scenario
+        projectId: state.projectId,
+        changeRecordId: state.changeRecordId,
       });
 
       if (result.error) {
@@ -279,22 +322,44 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
 
       const results: Array<{ taskId: string; success: boolean; qualityScore: number }> = [];
 
-      for (const mod of modules) {
-        const taskId = (mod as any).id ?? `task-${Date.now()}`;
-        const description = (mod as any).description ?? JSON.stringify(mod);
+      // Determine output directory for generated code
+      const outputDir = state.projectPath ?? process.cwd();
 
-        const graph = createCoderGraph(config.coderOverrides);
-        const coderResult = await graph.invoke({
-          taskDescription: description,
-          codeContext: {},
-        });
+      // Build full task description with design context so coder knows the full picture
+      const designContext = state.designDocument
+        ? `\n\n## Architecture Design Document\n\n${state.designDocument}`
+        : "";
+      const tasksContext = state.tasksDocument
+        ? `\n\n## Implementation Tasks\n\n${state.tasksDocument}`
+        : "";
 
-        results.push({
-          taskId,
-          success: coderResult.success,
-          qualityScore: coderResult.qualityScore,
-        });
-      }
+      // Single coder invocation with full design context (not per-module)
+      const modulesSummary = modules
+        .map((mod: any) => `- ${mod.id}: ${mod.name} — ${mod.description}`)
+        .join("\n");
+
+      const fullTaskDescription = [
+        `Implement the following project based on the architecture design.`,
+        `\n## Modules to Implement\n\n${modulesSummary}`,
+        designContext,
+        tasksContext,
+        `\n## Target Directory\n\nAll files must be created within: \`${outputDir}\``,
+      ].join("\n");
+
+      const graph = createCoderGraph(config.coderOverrides);
+      const coderResult = await graph.invoke({
+        taskDescription: fullTaskDescription,
+        codeContext: {
+          allowedDir: outputDir,
+          requirements: state.clarifiedRequirement || state.userRequirement,
+        },
+      });
+
+      results.push({
+        taskId: "full-implementation",
+        success: coderResult.success,
+        qualityScore: coderResult.qualityScore,
+      });
 
       return { coderResults: results };
     },
@@ -305,9 +370,72 @@ function createDefaultNodes(ctx: ChainContext, config: DevPipelineConfig) {
       const passedTasks = state.coderResults.filter((r) => r.success).length;
       const allPassed = totalTasks === 0 || passedTasks === totalTasks;
 
+      const scenarioLabel = state.scenario === "modify_existing" ? "incremental" : "new project";
+
+      // ── Auto-persist: save state to IncrementalDB ──
+      if (config.db && state.projectPath) {
+        try {
+          const db = config.db;
+          const project = db.getOrCreateProject(state.projectPath);
+          const version = project.currentVersion;
+
+          // Save requirement snapshot (proposal)
+          if (state.proposalDocument || state.clarifiedRequirement) {
+            const proposalContent = state.proposalDocument || state.clarifiedRequirement;
+            db.createSnapshot({
+              projectId: project.id,
+              version,
+              snapshotType: "requirement",
+              contentHash: IncrementalDBClass.contentHash(proposalContent),
+              requirementSummary: {
+                coreProblem: state.userRequirement,
+                features: [],
+                techStack: {},
+                totalRequirements: 1,
+              },
+            });
+          }
+
+          // Save architecture snapshot (design + modules + interfaces)
+          if (state.designDocument && state.architectureModules.length > 0) {
+            const archSnapshot: ArchitectureSnapshot = {
+              modules: state.architectureModules as any[],
+              interfaces: state.architectureInterfaces as any[],
+              entities: [],
+              apiEndpoints: [],
+              domains: [],
+            };
+            db.createSnapshot({
+              projectId: project.id,
+              version,
+              snapshotType: "architecture",
+              contentHash: IncrementalDBClass.contentHash(state.designDocument),
+              architectureJson: archSnapshot,
+            });
+          }
+
+          // Update project version on successful coding
+          if (allPassed && !state.error && state.coderResults.length > 0) {
+            db.updateProjectVersion(project.id, version + 1);
+            // Mark scenario as modify_existing for future runs
+            if (state.scenario === "new_project") {
+              db.updateProjectScenario(project.id, "modify_existing");
+            }
+          }
+
+          // Update change record if incremental
+          if (state.changeRecordId && allPassed) {
+            db.updateChangeStatus(state.changeRecordId, "applied", version + 1);
+          }
+        } catch (err) {
+          console.warn("[dev-pipeline] Failed to persist state to IncrementalDB:", err);
+        }
+      }
+
       return {
         success: !state.error && allPassed,
         summary: [
+          `Scenario: ${scenarioLabel}`,
           `Requirement: ${state.clarifiedRequirement ? "clarified" : "raw"}`,
           state.proposalDocument ? "proposal.md generated" : "",
           state.designDocument ? "design.md generated" : "",

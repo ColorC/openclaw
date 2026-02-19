@@ -171,6 +171,50 @@ export interface DomainDefinition {
   }>;
 }
 
+// ============================================================================
+// 增量修改共享类型（供 IncrementalDB 和工作流状态共用）
+// ============================================================================
+
+export interface ArchitectureSnapshot {
+  selectedPattern?: string;
+  modules: ModuleDefinition[];
+  interfaces: InterfaceDefinition[];
+  entities: EntityDefinition[];
+  apiEndpoints: ApiEndpointDefinition[];
+  domains: DomainDefinition[];
+  fileStructure?: Record<string, unknown>;
+}
+
+export interface RequirementSnapshotSummary {
+  coreProblem?: string;
+  targetUsers?: string;
+  features: Array<{ name: string; description: string }>;
+  techStack: Record<string, string[]>;
+  totalRequirements: number;
+}
+
+export interface ImpactSummary {
+  affectedModules: string[];
+  affectedInterfaces: string[];
+  affectedEntities: string[];
+  affectedEndpoints: string[];
+  affectedSpecs: string[];
+  impactLevel: "low" | "medium" | "high";
+  reasoning: string;
+}
+
+export interface DeltaPlanResult {
+  addedModules: ModuleDefinition[];
+  modifiedModules: Array<{ id: string; changes: Partial<ModuleDefinition>; reason: string }>;
+  removedModules: Array<{ id: string; reason: string }>;
+  addedInterfaces: InterfaceDefinition[];
+  modifiedInterfaces: Array<{ id: string; changes: Partial<InterfaceDefinition>; reason: string }>;
+  removedInterfaces: Array<{ id: string; reason: string }>;
+  addedEntities: EntityDefinition[];
+  modifiedEntities: Array<{ id: string; changes: Partial<EntityDefinition>; reason: string }>;
+  removedEntities: Array<{ id: string; reason: string }>;
+}
+
 export interface ArchitectureDesignState {
   // ===== 输入 =====
   /** 需求描述 */
@@ -181,6 +225,20 @@ export interface ArchitectureDesignState {
   scenario: "new_project" | "modify_existing";
   /** 项目路径（修改现有场景需要） */
   projectPath?: string;
+
+  // ===== 增量修改上下文 =====
+  /** 项目 ID（IncrementalDB） */
+  projectId?: string;
+  /** 变更记录 ID（IncrementalDB） */
+  changeRecordId?: number;
+  /** 现有架构快照（modify_existing 场景） */
+  existingArchitecture?: ArchitectureSnapshot;
+  /** 现有需求摘要（modify_existing 场景） */
+  existingRequirements?: RequirementSnapshotSummary;
+  /** 变更影响分析结果 */
+  changeImpact?: ImpactSummary;
+  /** 增量设计方案 */
+  deltaPlan?: DeltaPlanResult;
 
   // ===== 分析阶段 =====
   /** 需求分析结果 */
@@ -195,6 +253,10 @@ export interface ArchitectureDesignState {
     reasoning?: string;
     /** 推荐的架构方向 */
     recommendedArchitecture?: string;
+    /** 集成类型（从 analyze_requirement 提取） */
+    integrationType?: "pure_extension" | "core_modification" | "hybrid";
+    /** 入口方式 */
+    entryPoint?: "independent" | "sub_feature" | "hook";
   };
   /** 用户面向功能 */
   userFacingFeatures: FeatureDefinition[];
@@ -322,6 +384,8 @@ export interface CodeContext {
   test?: string;
   /** 需求描述 */
   requirements?: string;
+  /** 允许的工作目录 — 文件操作被限制在此目录内 */
+  allowedDir?: string;
   /** 错误报告 */
   errorReports?: Array<{
     file: string;
@@ -358,6 +422,12 @@ export interface CoderState {
   maxIterations: number;
   /** 质量阈值 */
   qualityThreshold: number;
+  /** 工作目录 — Agent 文件操作的根目录 */
+  workDir: string;
+  /** 编辑范围约束 — 写入操作被限制在此路径前缀内（如 extensions/stock-analyzer/） */
+  editScope?: string;
+  /** Agent 会话 ID — 支持多轮 agent 循环 */
+  sessionId?: string;
 
   // ===== 迭代控制 =====
   /** 当前迭代次数 */

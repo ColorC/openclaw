@@ -18,6 +18,10 @@ import type {
   EntityDefinition,
   ApiEndpointDefinition,
   DomainDefinition,
+  ArchitectureSnapshot,
+  RequirementSnapshotSummary,
+  ImpactSummary,
+  DeltaPlanResult,
 } from "./states.js";
 
 // ============================================================================
@@ -30,6 +34,15 @@ export const ArchitectureDesignAnnotation = Annotation.Root({
   projectContext: Annotation<Record<string, unknown>>({ default: () => ({}) }),
   scenario: Annotation<"new_project" | "modify_existing">({ default: () => "new_project" }),
   projectPath: Annotation<string | undefined>({ default: () => undefined }),
+  // 增量修改上下文
+  projectId: Annotation<string | undefined>({ default: () => undefined }),
+  changeRecordId: Annotation<number | undefined>({ default: () => undefined }),
+  existingArchitecture: Annotation<ArchitectureSnapshot | undefined>({ default: () => undefined }),
+  existingRequirements: Annotation<RequirementSnapshotSummary | undefined>({
+    default: () => undefined,
+  }),
+  changeImpact: Annotation<ImpactSummary | undefined>({ default: () => undefined }),
+  deltaPlan: Annotation<DeltaPlanResult | undefined>({ default: () => undefined }),
   // 分析
   requirementAnalysis: Annotation<ArchitectureDesignState["requirementAnalysis"]>({
     default: () => undefined,
@@ -99,7 +112,10 @@ export interface ArchitectureDesignNodeOverrides {
   designFileStructure?: ArchNodeExecutor;
   generateOpenspec?: ArchNodeExecutor;
   finalize?: ArchNodeExecutor;
-  analyzeExistingArchitecture?: ArchNodeExecutor;
+  // Incremental mode nodes
+  loadExistingContext?: ArchNodeExecutor;
+  analyzeChangeImpact?: ArchNodeExecutor;
+  designDelta?: ArchNodeExecutor;
 }
 
 // ============================================================================
@@ -199,7 +215,16 @@ const defaultNodes: Required<ArchitectureDesignNodeOverrides> = {
     return { success: !state.error };
   },
 
-  async analyzeExistingArchitecture(_state) {
+  // Incremental mode nodes (stubs — real implementations injected via overrides)
+  async loadExistingContext(_state) {
+    return {};
+  },
+
+  async analyzeChangeImpact(_state) {
+    return {};
+  },
+
+  async designDelta(_state) {
     return {};
   },
 };
@@ -214,8 +239,8 @@ function afterValidation(state: ArchitectureDesignGraphState): "scenario_route" 
 
 function scenarioRouter(
   state: ArchitectureDesignGraphState,
-): "analyze_requirement" | "analyze_existing" {
-  return state.scenario === "modify_existing" ? "analyze_existing" : "analyze_requirement";
+): "analyze_requirement" | "load_existing_context" {
+  return state.scenario === "modify_existing" ? "load_existing_context" : "analyze_requirement";
 }
 
 function shouldRefineOrContinue(
@@ -286,7 +311,10 @@ export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeO
     .addNode("design_file_structure", n.designFileStructure)
     .addNode("generate_openspec", n.generateOpenspec)
     .addNode("finalize", n.finalize)
-    .addNode("analyze_existing", n.analyzeExistingArchitecture)
+    // Incremental mode nodes
+    .addNode("load_existing_context", n.loadExistingContext)
+    .addNode("analyze_change_impact", n.analyzeChangeImpact)
+    .addNode("design_delta", n.designDelta)
     // 边
     .addEdge(START, "validate_input")
     .addConditionalEdges("validate_input", afterValidation, {
@@ -295,8 +323,9 @@ export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeO
     })
     .addConditionalEdges("scenario_route", scenarioRouter, {
       analyze_requirement: "analyze_requirement",
-      analyze_existing: "analyze_existing",
+      load_existing_context: "load_existing_context", // Map router output to node
     })
+    // new_project path
     .addEdge("analyze_requirement", "list_features")
     .addEdge("list_features", "select_pattern")
     .addConditionalEdges("select_pattern", scaleRouter, {
@@ -309,6 +338,11 @@ export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeO
     .addEdge("define_interfaces", "design_data_model")
     .addEdge("design_data_model", "design_api_endpoints")
     .addEdge("design_api_endpoints", "design_review")
+    // modify_existing path (incremental)
+    .addEdge("load_existing_context", "analyze_change_impact")
+    .addEdge("analyze_change_impact", "design_delta")
+    .addEdge("design_delta", "design_review") // Merges into common path
+    // Common validation path
     .addEdge("design_review", "validate_architecture")
     .addConditionalEdges("validate_architecture", shouldRefineOrContinue, {
       refine: "refine_design",
@@ -320,7 +354,6 @@ export function createArchitectureDesignGraph(overrides: ArchitectureDesignNodeO
     })
     .addEdge("design_file_structure", "generate_openspec")
     .addEdge("generate_openspec", "finalize")
-    .addEdge("analyze_existing", "finalize")
     .addEdge("finalize", END);
 
   return workflow.compile();

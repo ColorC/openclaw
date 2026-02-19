@@ -23,6 +23,12 @@ export const CoderAnnotation = Annotation.Root({
   codeContext: Annotation<CodeContext>({ default: () => ({}) }),
   maxIterations: Annotation<number>({ default: () => 10 }),
   qualityThreshold: Annotation<number>({ default: () => 0.7 }),
+  /** 工作目录 — Agent 文件操作的根目录 */
+  workDir: Annotation<string>({ default: () => process.cwd() }),
+  /** 编辑范围约束 — 写入操作被限制在此路径前缀内 */
+  editScope: Annotation<string | undefined>({ default: () => undefined }),
+  /** Agent 会话 ID — 支持多轮 agent 循环 */
+  sessionId: Annotation<string | undefined>({ default: () => undefined }),
   // 迭代
   iterationCount: Annotation<number>({ default: () => 0 }),
   currentCode: Annotation<string | undefined>({ default: () => undefined }),

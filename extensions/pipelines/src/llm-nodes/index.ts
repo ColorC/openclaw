@@ -41,12 +41,35 @@ export { createClaudeCodeCoderNode } from "./claude-code-coder-node.js";
 export type { ClaudeCodeCoderNodeDeps } from "./claude-code-coder-node.js";
 
 // Requirement Clarification nodes
-export { createRequirementClarificationNode } from "./requirement-clarification-nodes.js";
-export type { RequirementClarificationNodeDeps } from "./requirement-clarification-nodes.js";
+export {
+  createRequirementClarificationNode,
+  createCollectedInfo,
+  deserializeCollectedInfo,
+  formatCollectedInfo,
+  formatExistingRequirementsContext,
+  generateOpenSpecProposal,
+  generateOpenSpecChangeProposal,
+} from "./requirement-clarification-nodes.js";
+export type {
+  RequirementClarificationNodeDeps,
+  CollectedInfo,
+} from "./requirement-clarification-nodes.js";
 
 // OpenSpec generators
 export {
   generateDesignMarkdown,
   generateArchitectureTasksMarkdown,
   generateSpecMarkdown,
+  generateDeltaDesignMarkdown,
+  generateDeltaTasksMarkdown,
+  generateDeltaSpecMarkdown,
 } from "./openspec-generators.js";
+
+// Incremental design nodes
+export {
+  createLoadExistingContextNode,
+  createAnalyzeChangeImpactNode,
+  createDesignDeltaNode,
+  applyDelta,
+} from "./incremental-nodes.js";
+export type { IncrementalNodeDeps } from "./incremental-nodes.js";

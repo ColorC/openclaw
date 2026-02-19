@@ -23,11 +23,11 @@
 import type { ModelProviderConfig } from "../llm/types.js";
 import type { PromptRegistry } from "../prompts/prompt-registry.js";
 import type { RequirementClarificationGraphState } from "../workflows/requirement-clarification.js";
-import { createAgentRunner, type PipelineAgentTool } from "../llm/agent-adapter.js";
-
+import type { RequirementSnapshotSummary } from "../workflows/states.js";
 // ============================================================================
 // Deps
 // ============================================================================
+import { createAgentRunner, type PipelineAgentTool } from "../llm/agent-adapter.js";
 
 export interface RequirementClarificationNodeDeps {
   modelProviderConfig: ModelProviderConfig;
@@ -36,6 +36,10 @@ export interface RequirementClarificationNodeDeps {
   webSearchTool?: PipelineAgentTool;
   /** 可选：外部提供的 web_fetch 工具 */
   webFetchTool?: PipelineAgentTool;
+  /** 增量模式：现有需求摘要 */
+  existingRequirements?: RequirementSnapshotSummary;
+  /** 场景类型 */
+  scenario?: "new_project" | "modify_existing";
 }
 
 // ============================================================================
@@ -144,6 +148,39 @@ export function formatCollectedInfo(info: CollectedInfo): string {
   return lines.length > 0 ? lines.join("\n") : "（尚未收集任何信息）";
 }
 
+/** 格式化现有需求上下文（增量模式注入） */
+export function formatExistingRequirementsContext(existing?: RequirementSnapshotSummary): string {
+  if (!existing) return "";
+
+  const lines: string[] = ["【项目现有需求】", ""];
+
+  if (existing.coreProblem) {
+    lines.push(`核心问题: ${existing.coreProblem}`);
+  }
+  if (existing.targetUsers) {
+    lines.push(`目标用户: ${existing.targetUsers}`);
+  }
+
+  if (existing.features?.length) {
+    lines.push("", "现有功能:");
+    for (const f of existing.features) {
+      lines.push(`- ${f.name}: ${f.description}`);
+    }
+  }
+
+  if (existing.techStack && Object.keys(existing.techStack).length > 0) {
+    lines.push("", "现有技术栈:");
+    for (const [module, techs] of Object.entries(existing.techStack)) {
+      const techStr = Array.isArray(techs) ? techs.join(", ") : String(techs);
+      lines.push(`- ${module}: ${techStr}`);
+    }
+  }
+
+  lines.push("", `总需求数: ${existing.totalRequirements}`);
+
+  return lines.join("\n");
+}
+
 // ============================================================================
 // Summary Helpers
 // ============================================================================
@@ -250,28 +287,31 @@ function generateWhatChangesSection(info: CollectedInfo): string {
   let content = "";
 
   // Core Features
-  const featureKeys = Object.keys(req).filter(
-    (k) =>
-      ![
-        "core_problem",
-        "target_users",
-        "use_case",
-        "project_goals",
-        "success_criteria",
-        "tech_preferences",
-        "deployment_env",
-        "data_scale",
-        "detailed_background",
-        "constraints",
-        "budget_constraints",
-        "timeline",
-        "project_goal",
-        "goal",
-        "background",
-        "project_background",
-        "users",
-      ].includes(k),
-  );
+  const metaKeys = [
+    "core_problem",
+    "target_users",
+    "use_case",
+    "project_goals",
+    "success_criteria",
+    "tech_preferences",
+    "deployment_env",
+    "data_scale",
+    "detailed_background",
+    "constraints",
+    "budget_constraints",
+    "timeline",
+    "project_goal",
+    "goal",
+    "background",
+    "project_background",
+    "users",
+    "project_scale",
+    "integration_type",
+    "entry_point",
+    "edit_scope",
+  ];
+
+  const featureKeys = Object.keys(req).filter((k) => !metaKeys.includes(k));
 
   if (featureKeys.length > 0) {
     content += "### Core Features\n";
@@ -340,31 +380,48 @@ function generateCapabilitiesSection(info: CollectedInfo): string {
     return typeof entry === "string" ? entry : entry.value;
   };
 
-  let content = "### New Capabilities\n";
+  let content = "";
+
+  // Integration Context (OpenClaw Extension 特有)
+  const integrationType = get("integration_type");
+  const entryPoint = get("entry_point");
+  const editScope = get("edit_scope");
+  if (integrationType || entryPoint || editScope) {
+    content += "### Integration Context\n";
+    if (integrationType) content += `- **Integration Type**: ${integrationType}\n`;
+    if (entryPoint) content += `- **Entry Point**: ${entryPoint}\n`;
+    if (editScope) content += `- **Edit Scope**: ${editScope}\n`;
+    content += "\n";
+  }
+
+  content += "### New Capabilities\n";
 
   // 从 requirements 中提取功能点，生成 kebab-case 名称
-  const featureKeys = Object.keys(req).filter(
-    (k) =>
-      ![
-        "core_problem",
-        "target_users",
-        "use_case",
-        "project_goals",
-        "success_criteria",
-        "tech_preferences",
-        "deployment_env",
-        "data_scale",
-        "detailed_background",
-        "constraints",
-        "budget_constraints",
-        "timeline",
-        "project_goal",
-        "goal",
-        "background",
-        "project_background",
-        "users",
-      ].includes(k),
-  );
+  const metaKeys = [
+    "core_problem",
+    "target_users",
+    "use_case",
+    "project_goals",
+    "success_criteria",
+    "tech_preferences",
+    "deployment_env",
+    "data_scale",
+    "detailed_background",
+    "constraints",
+    "budget_constraints",
+    "timeline",
+    "project_goal",
+    "goal",
+    "background",
+    "project_background",
+    "users",
+    "project_scale",
+    "integration_type",
+    "entry_point",
+    "edit_scope",
+  ];
+
+  const featureKeys = Object.keys(req).filter((k) => !metaKeys.includes(k));
 
   if (featureKeys.length > 0) {
     for (const key of featureKeys) {
@@ -488,6 +545,197 @@ export function generateOpenSpecProposal(projectName: string, info: CollectedInf
 }
 
 // ============================================================================
+// Incremental Mode Proposal Generator
+// ============================================================================
+
+/**
+ * 生成增量修改模式的 OpenSpec Change Proposal
+ *
+ * 与 Greenfield 版本的区别：
+ * - Type: Incremental Change (not Greenfield Project)
+ * - Modified Capabilities: 有内容（列出修改的功能）
+ * - Impact: 指明受影响的 specs 和代码
+ */
+export function generateOpenSpecChangeProposal(
+  projectName: string,
+  info: CollectedInfo,
+  existingRequirements?: RequirementSnapshotSummary,
+): string {
+  const timestamp = new Date().toISOString().replace("T", " ").slice(0, 19);
+
+  const lines: string[] = [
+    `# ${projectName} — Incremental Change`,
+    "",
+    `**Generated**: ${timestamp}`,
+    "**Format**: OpenSpec v1.0 Proposal",
+    "**Type**: Incremental Change (增量修改)",
+    "",
+    "---",
+    "",
+    "## Why",
+    "",
+    generateWhySection(info),
+    "",
+    "## What Changes",
+    "",
+    generateWhatChangesSection(info),
+    "## Capabilities",
+    "",
+    generateCapabilitiesSectionIncremental(info, existingRequirements),
+    "## Impact",
+    "",
+    generateImpactSectionIncremental(info, existingRequirements),
+    "---",
+    "",
+    "**Next Steps**: Review the modified capabilities and proceed to architecture design for impact analysis.",
+    "",
+  ];
+
+  return lines.join("\n");
+}
+
+function generateCapabilitiesSectionIncremental(
+  info: CollectedInfo,
+  existing?: RequirementSnapshotSummary,
+): string {
+  const req = info.requirements;
+  const get = (key: string) => {
+    const entry = req[key];
+    if (!entry) return "";
+    return typeof entry === "string" ? entry : entry.value;
+  };
+
+  let content = "";
+
+  // New Capabilities (same as greenfield)
+  const metaKeys = [
+    "core_problem",
+    "target_users",
+    "use_case",
+    "project_goals",
+    "success_criteria",
+    "tech_preferences",
+    "deployment_env",
+    "data_scale",
+    "detailed_background",
+    "constraints",
+    "budget_constraints",
+    "timeline",
+    "project_goal",
+    "goal",
+    "background",
+    "project_background",
+    "users",
+    "project_scale",
+    "integration_type",
+    "entry_point",
+    "edit_scope",
+  ];
+
+  const featureKeys = Object.keys(req).filter((k) => !metaKeys.includes(k));
+
+  if (featureKeys.length > 0) {
+    content += "### New Capabilities\n";
+    for (const key of featureKeys) {
+      const kebab = key.replace(/[_\s]+/g, "-").toLowerCase();
+      const val = get(key);
+      if (val) content += `- \`${kebab}\`: ${val}\n`;
+    }
+    content += "\n";
+  }
+
+  // Modified Capabilities (reference existing features)
+  content += "### Modified Capabilities\n";
+  if (existing?.features?.length) {
+    // Agent should specify which existing features are being modified
+    const changeDesc = get("change_description") || get("modification_scope");
+    if (changeDesc) {
+      content += `本次变更影响以下现有功能：\n\n`;
+      for (const f of existing.features) {
+        content += `- \`${f.name}\`: ${f.description}\n`;
+      }
+      content += `\n变更描述：${changeDesc}\n`;
+    } else {
+      content += `项目现有 ${existing.features.length} 个功能（参考现有需求文档）。\n`;
+      content += `本次变更的具体影响将在架构设计阶段分析。\n`;
+    }
+  } else {
+    content += "<!-- 待架构设计阶段确定受影响的现有功能 -->\n";
+  }
+  content += "\n";
+
+  return content;
+}
+
+function generateImpactSectionIncremental(
+  info: CollectedInfo,
+  existing?: RequirementSnapshotSummary,
+): string {
+  const req = info.requirements;
+  const get = (key: string) => {
+    const entry = req[key];
+    if (!entry) return "";
+    return typeof entry === "string" ? entry : entry.value;
+  };
+
+  let content = "";
+
+  // Affected specs
+  content += "- **Affected specs**: 现有项目的 OpenSpec 文档\n";
+  if (existing?.features?.length) {
+    content += `  - 现有功能: ${existing.features.length} 个\n`;
+  }
+  content += "\n";
+
+  // Affected code
+  content += "- **Affected code**: 现有代码库\n";
+  content += "  - 具体影响的模块将在架构设计阶段确定\n";
+  content += "\n";
+
+  // Project Structure — 从技术栈推断
+  content += "- **Project Structure**:\n";
+  const techStack = info.techStack ?? existing?.techStack ?? {};
+  if (Object.keys(techStack).length > 0) {
+    const frontend = techStack.frontend ?? techStack["前端"];
+    const backend = techStack.backend ?? techStack["后端"];
+    if (frontend) {
+      content += `  - Frontend：${Array.isArray(frontend) ? frontend.join(", ") : frontend}\n`;
+    }
+    if (backend) {
+      content += `  - Backend：${Array.isArray(backend) ? backend.join(", ") : backend}\n`;
+    }
+  }
+  content += "\n";
+
+  // External Dependencies
+  const aiModule = techStack.ai ?? techStack["AI框架"];
+  const storage = techStack.storage ?? techStack["数据存储"];
+  if (aiModule || storage) {
+    content += "**External Dependencies**\n";
+    if (aiModule) {
+      const aiStr = Array.isArray(aiModule) ? aiModule.join(", ") : String(aiModule);
+      content += `- **AI/LLM**: ${aiStr}\n`;
+    }
+    if (storage) {
+      const storageStr = Array.isArray(storage) ? storage.join(", ") : String(storage);
+      content += `- **Storage**: ${storageStr}\n`;
+    }
+    content += "\n";
+  }
+
+  // Implementation Notes for incremental change
+  const changeDesc = get("change_description") || get("modification_scope");
+  if (changeDesc) {
+    content += "**Implementation Notes**\n";
+    content += `- 变更范围：${changeDesc}\n`;
+    content += "- 建议先进行架构影响分析，确定受影响的模块和接口\n";
+    content += "\n";
+  }
+
+  return content;
+}
+
+// ============================================================================
 // 内置工具定义
 // ============================================================================
 
@@ -503,13 +751,13 @@ export function createBuiltinTools(info: CollectedInfo): PipelineAgentTool[] {
           key: {
             type: "string",
             description:
-              "需求键名（如 target_users, core_problem, use_case, project_goals, success_criteria, detailed_background, constraints, deployment_env, tech_preferences, data_scale）",
+              "需求键名（如 target_users, core_problem, use_case, project_goals, success_criteria, detailed_background, constraints, deployment_env, tech_preferences, data_scale, project_scale, integration_type, entry_point, edit_scope）",
           },
           value: { type: "string", description: "需求值" },
           category: {
             type: "string",
             description: "分类",
-            enum: ["basic", "goals", "background", "tech", "detail"],
+            enum: ["basic", "goals", "background", "tech", "detail", "integration"],
           },
         },
         required: ["key", "value"],

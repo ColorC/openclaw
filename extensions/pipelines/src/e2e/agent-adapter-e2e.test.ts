@@ -58,11 +58,11 @@ function detectProvider() {
     // ignore
   }
 
-  if (process.env.GLM_API_KEY) {
+  if (process.env.GLM_API_KEY ?? process.env.BIGMODEL_API_KEY) {
     return {
       name: "GLM-5",
       config: {
-        apiKey: process.env.GLM_API_KEY,
+        apiKey: process.env.GLM_API_KEY ?? process.env.BIGMODEL_API_KEY,
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
         defaultModel: "glm-5",
       },

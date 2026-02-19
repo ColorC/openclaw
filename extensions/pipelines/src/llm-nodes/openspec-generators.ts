@@ -609,3 +609,484 @@ export function generateSpecMarkdown(
 
   return lines.join("\n");
 }
+
+// ============================================================================
+// Delta 文档生成 (增量修改模式)
+// ============================================================================
+
+import type { DeltaPlanResult, ImpactSummary, ArchitectureSnapshot } from "../workflows/states.js";
+
+/**
+ * 生成增量设计文档 (design-delta.md)
+ *
+ * 记录新增/修改/删除的组件，兼容 OpenSpec Delta Spec 格式。
+ */
+export function generateDeltaDesignMarkdown(params: {
+  requirement: string;
+  existingArchitecture?: ArchitectureSnapshot;
+  changeImpact?: ImpactSummary;
+  deltaPlan?: DeltaPlanResult;
+}): string {
+  const { requirement, existingArchitecture, changeImpact, deltaPlan } = params;
+  const lines: string[] = [];
+
+  lines.push("# Incremental Design: Change Delta", "");
+  lines.push("## Change Request", "");
+  lines.push(requirement, "");
+
+  // Impact Summary
+  if (changeImpact) {
+    lines.push("## Impact Analysis", "");
+    lines.push(`- **Level**: ${changeImpact.impactLevel}`);
+    lines.push(
+      `- **Affected Modules**: ${changeImpact.affectedModules.length > 0 ? changeImpact.affectedModules.join(", ") : "none"}`,
+    );
+    lines.push(
+      `- **Affected Interfaces**: ${changeImpact.affectedInterfaces.length > 0 ? changeImpact.affectedInterfaces.join(", ") : "none"}`,
+    );
+    lines.push(
+      `- **Affected Entities**: ${changeImpact.affectedEntities.length > 0 ? changeImpact.affectedEntities.join(", ") : "none"}`,
+    );
+    lines.push(
+      `- **Affected Endpoints**: ${changeImpact.affectedEndpoints.length > 0 ? changeImpact.affectedEndpoints.join(", ") : "none"}`,
+    );
+    lines.push("");
+    lines.push("**Reasoning:**", changeImpact.reasoning, "");
+  }
+
+  // Delta Plan
+  if (deltaPlan) {
+    lines.push("## Delta Plan", "");
+
+    // Modules
+    const hasModuleChanges =
+      deltaPlan.addedModules.length > 0 ||
+      deltaPlan.modifiedModules.length > 0 ||
+      deltaPlan.removedModules.length > 0;
+
+    if (hasModuleChanges) {
+      lines.push("### Modules", "");
+
+      if (deltaPlan.addedModules.length > 0) {
+        lines.push("**ADDED:**");
+        for (const m of deltaPlan.addedModules) {
+          lines.push(`- \`${m.id}\`: ${m.name} — ${m.description}`);
+        }
+        lines.push("");
+      }
+
+      if (deltaPlan.modifiedModules.length > 0) {
+        lines.push("**MODIFIED:**");
+        for (const m of deltaPlan.modifiedModules) {
+          lines.push(`- \`${m.id}\`: ${m.reason}`);
+          lines.push(`  - Changes: ${JSON.stringify(m.changes)}`);
+        }
+        lines.push("");
+      }
+
+      if (deltaPlan.removedModules.length > 0) {
+        lines.push("**REMOVED:**");
+        for (const m of deltaPlan.removedModules) {
+          lines.push(`- \`${m.id}\`: ${m.reason}`);
+        }
+        lines.push("");
+      }
+    }
+
+    // Interfaces
+    const hasInterfaceChanges =
+      deltaPlan.addedInterfaces.length > 0 ||
+      deltaPlan.modifiedInterfaces.length > 0 ||
+      deltaPlan.removedInterfaces.length > 0;
+
+    if (hasInterfaceChanges) {
+      lines.push("### Interfaces", "");
+
+      if (deltaPlan.addedInterfaces.length > 0) {
+        lines.push("**ADDED:**");
+        for (const i of deltaPlan.addedInterfaces) {
+          lines.push(`- \`${i.id}\`: ${i.name} (${i.type}) — ${i.methods.length} methods`);
+        }
+        lines.push("");
+      }
+
+      if (deltaPlan.modifiedInterfaces.length > 0) {
+        lines.push("**MODIFIED:**");
+        for (const i of deltaPlan.modifiedInterfaces) {
+          lines.push(`- \`${i.id}\`: ${i.reason}`);
+          lines.push(`  - Changes: ${JSON.stringify(i.changes)}`);
+        }
+        lines.push("");
+      }
+
+      if (deltaPlan.removedInterfaces.length > 0) {
+        lines.push("**REMOVED:**");
+        for (const i of deltaPlan.removedInterfaces) {
+          lines.push(`- \`${i.id}\`: ${i.reason}`);
+        }
+        lines.push("");
+      }
+    }
+
+    // Entities
+    const hasEntityChanges =
+      deltaPlan.addedEntities.length > 0 ||
+      deltaPlan.modifiedEntities.length > 0 ||
+      deltaPlan.removedEntities.length > 0;
+
+    if (hasEntityChanges) {
+      lines.push("### Entities", "");
+
+      if (deltaPlan.addedEntities.length > 0) {
+        lines.push("**ADDED:**");
+        for (const e of deltaPlan.addedEntities) {
+          lines.push(`- \`${e.id}\`: ${e.name} — ${e.attributes.length} attributes`);
+        }
+        lines.push("");
+      }
+
+      if (deltaPlan.modifiedEntities.length > 0) {
+        lines.push("**MODIFIED:**");
+        for (const e of deltaPlan.modifiedEntities) {
+          lines.push(`- \`${e.id}\`: ${e.reason}`);
+          lines.push(`  - Changes: ${JSON.stringify(e.changes)}`);
+        }
+        lines.push("");
+      }
+
+      if (deltaPlan.removedEntities.length > 0) {
+        lines.push("**REMOVED:**");
+        for (const e of deltaPlan.removedEntities) {
+          lines.push(`- \`${e.id}\`: ${e.reason}`);
+        }
+        lines.push("");
+      }
+    }
+  }
+
+  // Summary
+  const totalChanges = deltaPlan
+    ? deltaPlan.addedModules.length +
+      deltaPlan.modifiedModules.length +
+      deltaPlan.removedModules.length +
+      deltaPlan.addedInterfaces.length +
+      deltaPlan.modifiedInterfaces.length +
+      deltaPlan.removedInterfaces.length +
+      deltaPlan.addedEntities.length +
+      deltaPlan.modifiedEntities.length +
+      deltaPlan.removedEntities.length
+    : 0;
+
+  lines.push("## Summary", "");
+  lines.push(`Total changes: ${totalChanges}`, "");
+  lines.push(
+    `- Modules: +${deltaPlan?.addedModules.length ?? 0} ~${deltaPlan?.modifiedModules.length ?? 0} -${deltaPlan?.removedModules.length ?? 0}`,
+  );
+  lines.push(
+    `- Interfaces: +${deltaPlan?.addedInterfaces.length ?? 0} ~${deltaPlan?.modifiedInterfaces.length ?? 0} -${deltaPlan?.removedInterfaces.length ?? 0}`,
+  );
+  lines.push(
+    `- Entities: +${deltaPlan?.addedEntities.length ?? 0} ~${deltaPlan?.modifiedEntities.length ?? 0} -${deltaPlan?.removedEntities.length ?? 0}`,
+  );
+
+  return lines.join("\n");
+}
+
+/**
+ * 生成增量任务文档 (tasks-delta.md)
+ *
+ * 基于增量计划生成任务列表，仅包含变更相关的任务。
+ */
+export function generateDeltaTasksMarkdown(params: { deltaPlan?: DeltaPlanResult }): string {
+  const { deltaPlan } = params;
+  if (!deltaPlan) return "_No delta plan available_";
+
+  const lines: string[] = [];
+  let groupNum = 0;
+
+  // 1. Added Modules
+  if (deltaPlan.addedModules.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Create New Modules`, "");
+    let taskNum = 0;
+    for (const m of deltaPlan.addedModules) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Create module \`${m.id}\`: ${m.name}`);
+      for (const r of m.responsibilities) {
+        taskNum++;
+        lines.push(`- [ ] ${groupNum}.${taskNum} Implement: ${r}`);
+      }
+      if (m.dependencies.length > 0) {
+        taskNum++;
+        lines.push(`- [ ] ${groupNum}.${taskNum} Wire dependencies: ${m.dependencies.join(", ")}`);
+      }
+    }
+    lines.push("");
+  }
+
+  // 2. Modified Modules
+  if (deltaPlan.modifiedModules.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Modify Existing Modules`, "");
+    let taskNum = 0;
+    for (const m of deltaPlan.modifiedModules) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Update \`${m.id}\`: ${m.reason}`);
+    }
+    lines.push("");
+  }
+
+  // 3. Removed Modules
+  if (deltaPlan.removedModules.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Remove Deprecated Modules`, "");
+    let taskNum = 0;
+    for (const m of deltaPlan.removedModules) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Remove \`${m.id}\`: ${m.reason}`);
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Update dependents of \`${m.id}\``);
+    }
+    lines.push("");
+  }
+
+  // 4. Added Interfaces
+  if (deltaPlan.addedInterfaces.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Create New Interfaces`, "");
+    let taskNum = 0;
+    for (const i of deltaPlan.addedInterfaces) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Define interface \`${i.id}\` (${i.type})`);
+      for (const m of i.methods) {
+        taskNum++;
+        lines.push(`- [ ] ${groupNum}.${taskNum} Implement \`${m.name}\`: ${m.description}`);
+      }
+    }
+    lines.push("");
+  }
+
+  // 5. Modified Interfaces
+  if (deltaPlan.modifiedInterfaces.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Modify Existing Interfaces`, "");
+    let taskNum = 0;
+    for (const i of deltaPlan.modifiedInterfaces) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Update \`${i.id}\`: ${i.reason}`);
+    }
+    lines.push("");
+  }
+
+  // 6. Removed Interfaces
+  if (deltaPlan.removedInterfaces.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Remove Deprecated Interfaces`, "");
+    let taskNum = 0;
+    for (const i of deltaPlan.removedInterfaces) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Remove \`${i.id}\`: ${i.reason}`);
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Update consumers of \`${i.id}\``);
+    }
+    lines.push("");
+  }
+
+  // 7. Added Entities
+  if (deltaPlan.addedEntities.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Create New Entities`, "");
+    let taskNum = 0;
+    for (const e of deltaPlan.addedEntities) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Create entity \`${e.id}\`: ${e.name}`);
+      for (const a of e.attributes) {
+        taskNum++;
+        lines.push(`- [ ] ${groupNum}.${taskNum} Add attribute \`${a.name}: ${a.type}\``);
+      }
+      for (const r of e.relationships) {
+        taskNum++;
+        lines.push(
+          `- [ ] ${groupNum}.${taskNum} Define relationship → \`${r.target}\` (${r.type})`,
+        );
+      }
+    }
+    lines.push("");
+  }
+
+  // 8. Modified Entities
+  if (deltaPlan.modifiedEntities.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Modify Existing Entities`, "");
+    let taskNum = 0;
+    for (const e of deltaPlan.modifiedEntities) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Update \`${e.id}\`: ${e.reason}`);
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Write data migration for \`${e.id}\``);
+    }
+    lines.push("");
+  }
+
+  // 9. Removed Entities
+  if (deltaPlan.removedEntities.length > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Remove Deprecated Entities`, "");
+    let taskNum = 0;
+    for (const e of deltaPlan.removedEntities) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Archive data for \`${e.id}\`: ${e.reason}`);
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Remove \`${e.id}\` from codebase`);
+    }
+    lines.push("");
+  }
+
+  // 10. Testing
+  const totalChanges =
+    deltaPlan.addedModules.length +
+    deltaPlan.modifiedModules.length +
+    deltaPlan.removedModules.length +
+    deltaPlan.addedInterfaces.length +
+    deltaPlan.modifiedInterfaces.length +
+    deltaPlan.removedInterfaces.length +
+    deltaPlan.addedEntities.length +
+    deltaPlan.modifiedEntities.length +
+    deltaPlan.removedEntities.length;
+
+  if (totalChanges > 0) {
+    groupNum++;
+    lines.push(`## ${groupNum}. Testing & Verification`, "");
+    let taskNum = 0;
+    for (const m of deltaPlan.addedModules) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Unit tests for new module ${m.name}`);
+    }
+    for (const i of deltaPlan.addedInterfaces) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Contract tests for new interface ${i.name}`);
+    }
+    for (const e of deltaPlan.addedEntities) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Model tests for new entity ${e.name}`);
+    }
+    if (deltaPlan.modifiedEntities.length > 0) {
+      taskNum++;
+      lines.push(`- [ ] ${groupNum}.${taskNum} Integration tests for entity migrations`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * 生成 Delta Spec 文档 (spec-delta.md)
+ *
+ * 兼容 @fission-ai/openspec 的 Delta Spec 格式 (ADDED/MODIFIED/REMOVED/RENAMED)。
+ * 可被 parseDeltaSpec() 解析。
+ */
+export function generateDeltaSpecMarkdown(params: { deltaPlan?: DeltaPlanResult }): string {
+  const { deltaPlan } = params;
+  if (!deltaPlan) return "";
+
+  const lines: string[] = [];
+
+  // ADDED Requirements
+  const hasAdded =
+    deltaPlan.addedModules.length > 0 ||
+    deltaPlan.addedInterfaces.length > 0 ||
+    deltaPlan.addedEntities.length > 0;
+
+  if (hasAdded) {
+    lines.push("## ADDED Requirements", "");
+
+    for (const m of deltaPlan.addedModules) {
+      lines.push(`### Requirement: ${m.name}`, "");
+      lines.push(m.description, "");
+      lines.push(`- **id**: \`${m.id}\``);
+      lines.push(`- **type**: module`);
+      if (m.layer) lines.push(`- **layer**: ${m.layer}`);
+      lines.push("");
+    }
+
+    for (const i of deltaPlan.addedInterfaces) {
+      lines.push(`### Requirement: ${i.name}`, "");
+      lines.push(`Interface of type ${i.type} with ${i.methods.length} methods.`, "");
+      lines.push(`- **id**: \`${i.id}\``);
+      lines.push(`- **type**: interface`);
+      if (i.exposedBy) lines.push(`- **exposedBy**: ${i.exposedBy}`);
+      lines.push("");
+    }
+
+    for (const e of deltaPlan.addedEntities) {
+      lines.push(`### Requirement: ${e.name}`, "");
+      lines.push(e.description, "");
+      lines.push(`- **id**: \`${e.id}\``);
+      lines.push(`- **type**: entity`);
+      if (e.ownerModule) lines.push(`- **ownerModule**: ${e.ownerModule}`);
+      lines.push("");
+    }
+  }
+
+  // MODIFIED Requirements
+  const hasModified =
+    deltaPlan.modifiedModules.length > 0 ||
+    deltaPlan.modifiedInterfaces.length > 0 ||
+    deltaPlan.modifiedEntities.length > 0;
+
+  if (hasModified) {
+    lines.push("## MODIFIED Requirements", "");
+
+    for (const m of deltaPlan.modifiedModules) {
+      lines.push(`### Requirement: ${m.id}`, "");
+      lines.push(m.reason, "");
+      lines.push(`- **changes**: ${JSON.stringify(m.changes)}`);
+      lines.push("");
+    }
+
+    for (const i of deltaPlan.modifiedInterfaces) {
+      lines.push(`### Requirement: ${i.id}`, "");
+      lines.push(i.reason, "");
+      lines.push(`- **changes**: ${JSON.stringify(i.changes)}`);
+      lines.push("");
+    }
+
+    for (const e of deltaPlan.modifiedEntities) {
+      lines.push(`### Requirement: ${e.id}`, "");
+      lines.push(e.reason, "");
+      lines.push(`- **changes**: ${JSON.stringify(e.changes)}`);
+      lines.push("");
+    }
+  }
+
+  // REMOVED Requirements
+  const hasRemoved =
+    deltaPlan.removedModules.length > 0 ||
+    deltaPlan.removedInterfaces.length > 0 ||
+    deltaPlan.removedEntities.length > 0;
+
+  if (hasRemoved) {
+    lines.push("## REMOVED Requirements", "");
+
+    for (const m of deltaPlan.removedModules) {
+      lines.push(`### Requirement: ${m.id}`, "");
+      lines.push(`**Reason:** ${m.reason}`, "");
+      lines.push("");
+    }
+
+    for (const i of deltaPlan.removedInterfaces) {
+      lines.push(`### Requirement: ${i.id}`, "");
+      lines.push(`**Reason:** ${i.reason}`, "");
+      lines.push("");
+    }
+
+    for (const e of deltaPlan.removedEntities) {
+      lines.push(`### Requirement: ${e.id}`, "");
+      lines.push(`**Reason:** ${e.reason}`, "");
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n");
+}

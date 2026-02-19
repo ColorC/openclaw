@@ -2,7 +2,11 @@
  * Coder LLM Nodes — 测试
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import type { ChatResponse } from "../llm/types.js";
 import type { CoderGraphState } from "../workflows/coder.js";
 import { MockModelProvider, mockToolCallResponse } from "../llm/mock-model-provider.js";
 import { PromptRegistry } from "../prompts/prompt-registry.js";
@@ -12,12 +16,17 @@ import { createRecursiveCoderNode, createHandleArgueNode } from "./coder-nodes.j
 // Helpers
 // ============================================================================
 
+let tempDir: string;
+
 function makeState(overrides: Partial<CoderGraphState> = {}): CoderGraphState {
   return {
     taskDescription: "Implement a calculator with add and subtract",
-    codeContext: {},
+    codeContext: { allowedDir: tempDir },
     maxIterations: 10,
     qualityThreshold: 0.7,
+    workDir: tempDir,
+    editScope: undefined,
+    sessionId: undefined,
     iterationCount: 0,
     currentCode: undefined,
     validationResult: undefined,
@@ -37,6 +46,32 @@ function makeState(overrides: Partial<CoderGraphState> = {}): CoderGraphState {
   };
 }
 
+/** Mock a multi-turn agent sequence: write_file → coder_done */
+function mockAgentSequence(
+  files: Array<{ path: string; content: string }>,
+  summary: string,
+  qualityScore: number,
+): ChatResponse[] {
+  const responses: ChatResponse[] = [];
+
+  // One response per write_file call
+  for (const f of files) {
+    responses.push(mockToolCallResponse("write_file", { path: f.path, content: f.content }));
+  }
+
+  // Final response: coder_done
+  responses.push(
+    mockToolCallResponse("coder_done", {
+      summary,
+      createdFiles: files.map((f) => f.path),
+      modifiedFiles: [],
+      qualityScore,
+    }),
+  );
+
+  return responses;
+}
+
 // ============================================================================
 // recursiveCoder
 // ============================================================================
@@ -46,38 +81,52 @@ describe("createRecursiveCoderNode", () => {
 
   beforeEach(() => {
     pr = new PromptRegistry();
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "coder-test-"));
   });
 
-  it("should generate code via tool call", async () => {
-    const mp = new MockModelProvider([
-      mockToolCallResponse("generate_code", {
-        code: "export function add(a: number, b: number) { return a + b; }",
-        modifiedFiles: ["src/calc.ts"],
-        qualityScore: 0.85,
-        explanation: "Implemented add function",
-      }),
-    ]);
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("should create files and complete via agent loop", async () => {
+    const responses = mockAgentSequence(
+      [
+        {
+          path: "src/calc.ts",
+          content: "export function add(a: number, b: number) { return a + b; }",
+        },
+      ],
+      "Implemented add function",
+      0.85,
+    );
+    const mp = new MockModelProvider(responses);
     const node = createRecursiveCoderNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
-    expect(result.currentCode).toContain("add");
     expect(result.qualityScore).toBe(0.85);
     expect(result.qualityHistory).toEqual([0.85]);
     expect(result.validationResult!.passed).toBe(true);
-    expect(result.modifiedFiles).toEqual(["src/calc.ts"]);
+    expect(result.modifiedFiles).toContain("src/calc.ts");
     expect(result.iterationCount).toBe(1);
+    expect(result.implementationSummary).toBe("Implemented add function");
+
+    // Verify file was actually written
+    const filePath = path.join(tempDir, "src/calc.ts");
+    expect(fs.existsSync(filePath)).toBe(true);
+    expect(fs.readFileSync(filePath, "utf-8")).toContain("add");
   });
 
   it("should include error context when fixing", async () => {
-    const mp = new MockModelProvider([
-      mockToolCallResponse("generate_code", {
-        code: "// fixed code",
-        qualityScore: 0.75,
-      }),
-    ]);
+    const responses = mockAgentSequence(
+      [{ path: "src/calc.ts", content: "// fixed code" }],
+      "Fixed lint errors",
+      0.75,
+    );
+    const mp = new MockModelProvider(responses);
     const node = createRecursiveCoderNode({ modelProvider: mp, promptRegistry: pr });
     const state = makeState({
       codeContext: {
+        allowedDir: tempDir,
         skeleton: "// skeleton",
         errorReports: [
           { file: "src/calc.ts", line: 10, message: "Missing return type", type: "lint" },
@@ -91,25 +140,37 @@ describe("createRecursiveCoderNode", () => {
     expect(systemMsg.content).toContain("Missing return type");
   });
 
-  it("should fallback when LLM does not call tool", async () => {
-    const mp = new MockModelProvider([{ content: "text response" }]);
+  it("should handle graceful exit when LLM returns no tool calls", async () => {
+    const mp = new MockModelProvider([{ content: "I'm done thinking" }]);
     const node = createRecursiveCoderNode({ modelProvider: mp, promptRegistry: pr });
     const result = await node(makeState());
 
-    expect(result.currentCode).toBe("// No code generated");
+    // Agent loop exits gracefully with default quality
     expect(result.qualityScore).toBe(0.5);
     expect(result.validationResult!.passed).toBe(false);
-    expect(result.validationResult!.errors[0]).toContain("did not call generate_code");
+    expect(result.iterationCount).toBe(1);
   });
 
   it("should use coder modelRole", async () => {
-    const mp = new MockModelProvider([
-      mockToolCallResponse("generate_code", { code: "x", qualityScore: 0.8 }),
-    ]);
+    const responses = mockAgentSequence([{ path: "x.ts", content: "x" }], "done", 0.8);
+    const mp = new MockModelProvider(responses);
     const node = createRecursiveCoderNode({ modelProvider: mp, promptRegistry: pr });
     await node(makeState());
 
     expect(mp.calls[0].options?.modelRole).toBe("coder");
+  });
+
+  it("should enforce directory constraint", async () => {
+    // write_file with path escape attempt — the tool executor should reject it
+    const mp = new MockModelProvider([
+      mockToolCallResponse("write_file", { path: "../../etc/passwd", content: "hacked" }),
+      mockToolCallResponse("coder_done", { summary: "done", qualityScore: 0.5 }),
+    ]);
+    const node = createRecursiveCoderNode({ modelProvider: mp, promptRegistry: pr });
+    await node(makeState());
+
+    // File should NOT exist outside allowed dir
+    expect(fs.existsSync(path.join(tempDir, "../../etc/passwd"))).toBe(false);
   });
 });
 
@@ -122,6 +183,11 @@ describe("createHandleArgueNode", () => {
 
   beforeEach(() => {
     pr = new PromptRegistry();
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "coder-test-"));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
   it("should return no argue when validation passed", async () => {

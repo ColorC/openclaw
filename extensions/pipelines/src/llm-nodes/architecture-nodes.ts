@@ -40,6 +40,8 @@ const analyzeRequirementTool: ToolDefinition = {
       techFeatures: { type: "array", items: { type: "string" } },
       reasoning: { type: "string" },
       recommendedArchitecture: { type: "string" },
+      integrationType: { type: "string", enum: ["pure_extension", "core_modification", "hybrid"] },
+      entryPoint: { type: "string", enum: ["independent", "sub_feature", "hook"] },
     },
     required: ["scale", "complexity", "domain", "keyEntities", "techFeatures", "reasoning"],
   },
@@ -492,11 +494,29 @@ const generateOpenspecTool: ToolDefinition = {
 // ============================================================================
 
 function extractToolArgs(
-  response: { toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }> },
+  response: {
+    content?: string;
+    toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }>;
+  },
   toolName: string,
 ) {
   const tc = response.toolCalls?.find((t) => t.name === toolName);
-  return tc?.arguments;
+  if (!tc) {
+    const availableTools = response.toolCalls?.map((t) => t.name).join(", ") || "(none)";
+    const textPreview = (response.content ?? "").slice(0, 200);
+    console.warn(
+      `[arch] ⚠ extractToolArgs: expected tool "${toolName}" not found. Available: [${availableTools}]. LLM text: "${textPreview}"`,
+    );
+    return undefined;
+  }
+  const args = tc.arguments;
+  if (args && (args as any)._parseError) {
+    console.warn(
+      `[arch] ⚠ extractToolArgs: tool "${toolName}" returned malformed JSON: ${(args as any)._raw?.slice(0, 300)}`,
+    );
+    return undefined;
+  }
+  return args;
 }
 
 async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2, delayMs = 1000): Promise<T> {
@@ -607,6 +627,10 @@ export function createAnalyzeRequirementNode(deps: ArchitectureNodeDeps) {
         techFeatures: (args.techFeatures as string[]) ?? [],
         reasoning: (args.reasoning as string) ?? "",
         recommendedArchitecture: args.recommendedArchitecture as string | undefined,
+        integrationType:
+          (args.integrationType as "pure_extension" | "core_modification" | "hybrid") ??
+          "pure_extension",
+        entryPoint: (args.entryPoint as "independent" | "sub_feature" | "hook") ?? "independent",
       },
     };
   };
@@ -618,6 +642,11 @@ function mapComplexity(c: string): "low" | "medium" | "high" {
   return "medium";
 }
 
+/** Extract integration_type from state for prompt template injection */
+function getIntegrationType(state: ArchitectureDesignGraphState): string {
+  return state.requirementAnalysis?.integrationType ?? "pure_extension";
+}
+
 export function createListFeaturesNode(deps: ArchitectureNodeDeps) {
   return async (
     state: ArchitectureDesignGraphState,
@@ -627,6 +656,7 @@ export function createListFeaturesNode(deps: ArchitectureNodeDeps) {
       {
         requirement: state.requirement,
         analysis_json: JSON.stringify(state.requirementAnalysis ?? {}),
+        integration_type: getIntegrationType(state),
       },
       state.requirement,
     );
@@ -677,7 +707,11 @@ export function createSelectPatternNode(deps: ArchitectureNodeDeps) {
     ];
     const messages = deps.promptRegistry.buildMessages(
       "architecture/select-pattern",
-      { requirement: state.requirement, features_json: JSON.stringify(allFeatures) },
+      {
+        requirement: state.requirement,
+        features_json: JSON.stringify(allFeatures),
+        integration_type: getIntegrationType(state),
+      },
       state.requirement,
     );
     const response = await deps.modelProvider.chatWithTools(
@@ -793,6 +827,7 @@ async function designModulesSinglePass(
       communication_pattern: arch?.communicationPattern ?? "",
       scale: analysis?.scale ?? "medium",
       complexity: analysis?.complexity ?? "medium",
+      integration_type: analysis?.integrationType ?? "pure_extension",
     },
     state.requirement,
   );
@@ -803,9 +838,17 @@ async function designModulesSinglePass(
     }),
   );
   const step1Args = extractToolArgs(step1Response, "design_modules");
-  if (!step1Args) return { modules: [], responsibilityMatrix: [] };
+  if (!step1Args) {
+    console.warn(
+      "[arch] designModulesSinglePass: LLM did not produce design_modules tool call — returning empty modules",
+    );
+    return { modules: [], responsibilityMatrix: [] };
+  }
 
   const modules = (step1Args.modules as any[]) ?? [];
+  if (modules.length === 0) {
+    console.warn("[arch] designModulesSinglePass: design_modules tool returned 0 modules");
+  }
 
   // Step 2: Assign responsibility matrix
   const matrix = await assignResponsibilityMatrix(
@@ -882,6 +925,7 @@ async function designModulesPerDomain(
         communication_pattern: globalContext.communication_pattern,
         scale: "medium",
         complexity: analysis?.complexity ?? "medium",
+        integration_type: analysis?.integrationType ?? "pure_extension",
       },
       domainPrompt,
     );
@@ -893,11 +937,19 @@ async function designModulesPerDomain(
       }),
     );
     const args = extractToolArgs(response, "design_modules");
+    if (!args) {
+      console.warn(
+        `[arch] designModulesPerDomain: LLM did not produce design_modules for domain "${domain.name}"`,
+      );
+    }
     const domainModules = (args?.modules as any[]) ?? [];
     allModules.push(...domainModules);
   }
 
-  if (allModules.length === 0) return { modules: [], responsibilityMatrix: [] };
+  if (allModules.length === 0) {
+    console.warn("[arch] designModulesPerDomain: all domains returned 0 modules");
+    return { modules: [], responsibilityMatrix: [] };
+  }
 
   // Assign responsibility matrix for all modules across all features
   const matrix = await assignResponsibilityMatrix(
@@ -932,6 +984,7 @@ async function assignResponsibilityMatrix(
       communication_pattern: arch?.communicationPattern ?? "",
       scale: analysis?.scale ?? "medium",
       complexity: analysis?.complexity ?? "medium",
+      integration_type: analysis?.integrationType ?? "pure_extension",
     },
     `Assign responsibility matrix for these modules: ${JSON.stringify(modules.map((m: any) => ({ id: m.id, name: m.name })))} and features: ${JSON.stringify(allFeatures.map((f: any) => ({ id: f.id, name: f.name })))}`,
   );
@@ -980,7 +1033,12 @@ async function defineInterfacesSinglePass(
     }),
   );
   const args = extractToolArgs(response, "define_interfaces");
-  if (!args) return { interfaces: [] };
+  if (!args) {
+    console.warn(
+      "[arch] defineInterfacesSinglePass: LLM did not produce define_interfaces tool call — returning empty interfaces",
+    );
+    return { interfaces: [] };
+  }
 
   return { interfaces: (args.interfaces as any[]) ?? [] };
 }
@@ -1034,7 +1092,11 @@ async function defineInterfacesPerDomain(
       }),
     );
     const args = extractToolArgs(response, "define_interfaces");
-    if (args?.interfaces) {
+    if (!args) {
+      console.warn(
+        `[arch] defineInterfacesPerDomain: LLM did not produce define_interfaces for domain "${domain.name}"`,
+      );
+    } else if (args.interfaces) {
       allInterfaces.push(...(args.interfaces as any[]));
     }
   }
@@ -1055,6 +1117,7 @@ export function createDesignReviewNode(deps: ArchitectureNodeDeps) {
         interfaces_json: JSON.stringify(state.interfaces),
         entities_json: JSON.stringify(state.entities ?? []),
         api_endpoints_json: JSON.stringify(state.apiEndpoints ?? []),
+        integration_type: getIntegrationType(state),
       },
       "Review this architecture design.",
     );
@@ -1099,6 +1162,7 @@ export function createValidateArchitectureNode(deps: ArchitectureNodeDeps) {
         entities_json: JSON.stringify(state.entities ?? []),
         api_endpoints_json: JSON.stringify(state.apiEndpoints ?? []),
         review_json: JSON.stringify(state.designReview ?? {}),
+        integration_type: getIntegrationType(state),
       },
       "Validate this architecture.",
     );
@@ -1340,12 +1404,40 @@ export function createDesignFileStructureNode(deps: ArchitectureNodeDeps) {
   return async (
     state: ArchitectureDesignGraphState,
   ): Promise<Partial<ArchitectureDesignGraphState>> => {
+    const analysis = state.requirementAnalysis;
+    const arch = state.customArchitecture;
+
+    // Build module size budget summary from upstream estimatedSize
+    const moduleSizeBudget = state.modules
+      .filter((m) => m.estimatedSize)
+      .map(
+        (m) =>
+          `- ${m.id} (${m.name}): ~${m.estimatedSize!.files} files, ~${m.estimatedSize!.lines} lines`,
+      )
+      .join("\n");
+    const totalEstimatedFiles = state.modules.reduce(
+      (sum, m) => sum + (m.estimatedSize?.files ?? 0),
+      0,
+    );
+
     const messages = deps.promptRegistry.buildMessages(
       "architecture/design-file-structure",
       {
+        requirement: state.requirement,
         pattern: state.selectedPattern ?? "layered",
+        scale: analysis?.scale ?? "medium",
+        complexity: analysis?.complexity ?? "medium",
+        integration_type: analysis?.integrationType ?? "pure_extension",
+        architecture_name: arch?.name ?? state.selectedPattern ?? "layered",
+        architecture_description: arch?.description ?? "",
+        module_organization: arch?.moduleOrganization ?? "",
         modules_json: JSON.stringify(state.modules),
         interfaces_json: JSON.stringify(state.interfaces),
+        entities_json: JSON.stringify(state.entities ?? []),
+        api_endpoints_json: JSON.stringify(state.apiEndpoints ?? []),
+        domains_json: JSON.stringify(state.domains ?? []),
+        module_size_budget: moduleSizeBudget || "(no estimates available)",
+        total_estimated_files: String(totalEstimatedFiles || "unknown"),
       },
       "Design the file structure.",
     );

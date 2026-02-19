@@ -58,11 +58,13 @@ function detectProvider(): ProviderInfo | null {
       config: { apiKey: process.env.OPENAI_API_KEY, defaultModel: "gpt-4o-mini" },
     };
   }
-  if (process.env.GLM_API_KEY) {
+  // GLM API Key 可以是 GLM_API_KEY 或 BIGMODEL_API_KEY
+  const glmKey = process.env.GLM_API_KEY ?? process.env.BIGMODEL_API_KEY;
+  if (glmKey) {
     return {
       name: "GLM-5",
       config: {
-        apiKey: process.env.GLM_API_KEY,
+        apiKey: glmKey,
         baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
         defaultModel: "glm-5",
       },
