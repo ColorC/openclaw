@@ -96,11 +96,27 @@ def run_tdd_phase(workspace: str, llm) -> TDDResult:
     print(f"  White-box: {'PASSED' if result.whitebox_passed else 'FAILED'}")
     print(f"  Black-box: {'PASSED' if result.blackbox_passed else 'FAILED'}")
     print(f"  Retries: {result.retry_count}")
+    print(f"  Debug reports: {len(result.debug_reports)}")
+    print(f"  Legacy issues: {len(result.legacy_issues)}")
     print(f"  Stub files: {result.stub_files}")
     print(f"  Test files: {result.test_files}")
     print(f"  Files created: {len(result.files_created)}")
     for f in sorted(result.files_created)[:20]:
         print(f"    - {f}")
+
+    # Print debug report summaries
+    for i, dr in enumerate(result.debug_reports):
+        print(f"\n  Debug Report #{i+1}:")
+        print(f"    Failing tests: {dr.failing_tests}")
+        print(f"    Hypotheses: {len(dr.hypotheses)} active, {len(dr.excluded_hypotheses)} excluded")
+        for h in dr.hypotheses:
+            print(f"      [{h.status}] {h.id}: {h.description[:80]}")
+
+    # Print legacy issues
+    for issue in result.legacy_issues:
+        print(f"\n  Legacy Issue: {issue.test_name}")
+        print(f"    Status: {issue.final_status}")
+        print(f"    Attempts: {len(issue.all_attempts)}")
 
     return result
 

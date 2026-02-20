@@ -34,6 +34,13 @@ from toyshop.tdd_pipeline import (
     TDDResult,
 )
 
+# Debug subsystems
+from toyshop.debug_hypothesis import DebugReport, DebugHypothesis, CodingChallenge
+from toyshop.debug_probe import ProbeInstrumentor, DiagnosticProbe
+from toyshop.fault_localize import FaultLocalizer, SuspiciousLine
+from toyshop.expected_comparison import TestVerdict, LegacyIssue
+from toyshop.rollback import RollbackManager
+
 __all__ = [
     # Legacy
     "create_llm",
@@ -58,4 +65,15 @@ __all__ = [
     # TDD Pipeline
     "run_tdd_pipeline",
     "TDDResult",
+    # Debug subsystems
+    "DebugReport",
+    "DebugHypothesis",
+    "CodingChallenge",
+    "ProbeInstrumentor",
+    "DiagnosticProbe",
+    "FaultLocalizer",
+    "SuspiciousLine",
+    "TestVerdict",
+    "LegacyIssue",
+    "RollbackManager",
 ]

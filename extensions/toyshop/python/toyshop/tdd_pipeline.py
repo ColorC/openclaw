@@ -5,17 +5,21 @@ Pipeline flow:
   Phase 2: Test Generation (Test Agent - write mode, restricted to tests/)
   Phase 3: Code Implementation (Code Agent - blocked from tests/)
   Phase 4: White-box Verification (Test Agent - verify mode, read-only)
+  Phase 4.5: Debug Analysis (Debug Agent - probes, fault localization, hypotheses)
   Phase 5: Black-box Verification (auto-generated from spec.md scenarios)
+  Phase 6: Final Report (legacy issues, debug history)
 
 Key design: agents have different tool permissions enforced at the executor level,
-not just via prompt instructions.
+not just via prompt instructions. Debug Agent uses hypothesis-driven debugging with
+diagnostic probes and SBFL fault localization.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
@@ -44,6 +48,33 @@ from openhands.tools.file_editor.impl import FileEditorExecutor
 # Reuse FileReadTool from ux_agent
 from toyshop.ux_agent import FileReadTool
 
+# Debug subsystems
+from toyshop.rollback import RollbackManager
+from toyshop.debug_probe import get_instrumentor, reset_probe_counter
+from toyshop.fault_localize import FaultLocalizer, SuspiciousLine
+from toyshop.debug_hypothesis import (
+    DebugHypothesis,
+    DebugReport,
+    CodingChallenge,
+    ProbeEvidence,
+    get_hypothesis_manager,
+    parse_challenge_from_finish,
+)
+from toyshop.test_combination import (
+    expose_as_whitebox,
+    generate_variant_tests_for_failures,
+)
+from toyshop.expected_comparison import (
+    TestVerdict,
+    LegacyIssue,
+    mark_as_legacy,
+)
+
+# Import tools to trigger registration of new tools
+import toyshop.debug_probe  # noqa: F401 — registers probe_tool
+import toyshop.fault_localize  # noqa: F401 — registers fault_localize
+import toyshop.debug_hypothesis  # noqa: F401 — registers hypothesis_tool
+
 if TYPE_CHECKING:
     from openhands.sdk.conversation import LocalConversation
     from openhands.sdk.conversation.state import ConversationState
@@ -56,6 +87,7 @@ if TYPE_CHECKING:
 MAX_WHITEBOX_RETRIES = 3
 MAX_BLACKBOX_RETRIES = 2
 MAX_TOTAL_RETRIES = 5
+MAX_CHALLENGE_RETRIES = 2  # max times Coding Agent can challenge hypotheses
 
 
 # =============================================================================
@@ -96,6 +128,10 @@ class TDDResult:
     blackbox_output: str = ""
     summary: str = ""
     retry_count: int = 0
+    # Debug enhancement fields
+    legacy_issues: list[LegacyIssue] = field(default_factory=list)
+    debug_reports: list[DebugReport] = field(default_factory=list)
+    verdicts: list[TestVerdict] = field(default_factory=list)
 
 
 # =============================================================================
@@ -505,6 +541,72 @@ TEST_AGENT_VERIFY_PROMPT = """You are a test verification agent. Run tests and a
 When done, call finish with the complete test results and analysis.
 """
 
+TDD_CODE_AGENT_WITH_DEBUG_PROMPT = """You are an expert developer. Implement code to make all tests pass.
+
+You have received a Debug Report with hypotheses about the bug. Follow these hypotheses.
+
+## Your Workflow
+1. Read the Debug Report carefully — it contains fault localization and hypotheses
+2. Focus on CONFIRMED hypotheses first, then SUSPICIOUS ones
+3. Implement fixes based on the hypotheses
+4. Run `pytest tests/ -v` after each fix
+5. If your fix doesn't work and you believe a hypothesis is WRONG:
+   Output in your finish message: [CHALLENGE:hyp_XXX] reason: <why the hypothesis is wrong>
+   [EVIDENCE] <code or output that proves the hypothesis wrong>
+
+## Rules
+- Do NOT modify any files in the tests/ directory
+- Do NOT change function/class signatures
+- Address the hypotheses — don't ignore them
+- If you challenge a hypothesis, provide CLEAR evidence
+
+When done, call finish with a summary and test results.
+"""
+
+DEBUG_AGENT_PROMPT = """You are a debug analyst. Analyze test failures using scientific debugging.
+
+## Your Tools
+- `fault_localize`: Run SBFL fault localization to rank suspicious code lines
+- `probe_tool`: Insert diagnostic probes into source code
+  - insert_trace: non-interrupting log (program runs to completion)
+  - insert_halt: interrupting breakpoint (program exits at that point with code 99)
+  - remove_all: restore all files to original state
+  - collect: parse probe output from test run
+- `hypothesis_tool`: Manage debug hypotheses
+  - create: propose a new hypothesis
+  - update: change status (confirmed/excluded/suspicious)
+  - add_evidence: attach probe evidence to a hypothesis
+- `terminal`: Run tests to collect probe output
+- `FileReadTool`: Read source code
+
+## Your Workflow
+1. Run `fault_localize` with command="localize" to get suspicious line ranking
+2. Read the suspicious code and the failing test output
+3. Create 1-3 hypotheses about the bug cause using `hypothesis_tool`
+4. For each hypothesis:
+   a. Insert trace probes at suspicious locations using `probe_tool`
+   b. Run the failing test: `pytest <test_file>::<test_name> -v -s 2>&1`
+   c. Collect probe output using `probe_tool` command="collect"
+   d. Add evidence to the hypothesis using `hypothesis_tool`
+   e. Update hypothesis status based on evidence
+   f. If needed, insert halt probes to narrow down further
+5. After investigation, remove all probes: `probe_tool` command="remove_all"
+6. Generate final report: `hypothesis_tool` command="report"
+
+## Hypothesis Status Guide
+- confirmed: Evidence clearly supports this is the bug cause
+- excluded: Evidence proves this is NOT the cause
+- suspicious: Evidence is inconclusive, needs more investigation
+
+## Rules
+- You CANNOT edit business code — only insert probes
+- ALWAYS remove all probes before finishing
+- Be systematic: one hypothesis at a time
+- Provide clear reasoning for each status change
+
+When done, call finish with your analysis summary.
+"""
+
 
 # =============================================================================
 # Agent creation
@@ -567,6 +669,39 @@ def create_test_agent_verify(llm: LLM) -> Agent:
         ],
         include_default_tools=["FinishTool"],
         system_prompt_kwargs={"custom_prompt": TEST_AGENT_VERIFY_PROMPT},
+    )
+
+
+def create_debug_agent(llm: LLM) -> Agent:
+    """Create Debug Agent — probes + fault localization + hypotheses, read-only for code."""
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "probe_tool"},
+            {"name": "fault_localize"},
+            {"name": "hypothesis_tool"},
+            {"name": FileReadTool.name},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": DEBUG_AGENT_PROMPT},
+    )
+
+
+def create_code_agent_with_debug(llm: LLM) -> Agent:
+    """Create Code Agent that receives debug hypotheses."""
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "code_file_editor"},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": TDD_CODE_AGENT_WITH_DEBUG_PROMPT},
     )
 
 
@@ -838,33 +973,78 @@ def run_tdd_pipeline(
     else:
         print("[TDD] No spec.md scenarios found, skipping black-box tests")
 
-    # ── Retry loop: Phase 3 → Phase 4 → Phase 5 ──
+    # ── Retry loop: Phase 3 → Phase 4 → Phase 4.5 → Phase 5 ──
     retry_count = 0
     whitebox_passed = False
     blackbox_passed = False
     whitebox_output = ""
     blackbox_output = ""
-    failure_context = ""
+    debug_report: DebugReport | None = None
+    challenge: CodingChallenge | None = None
+    challenge_count = 0
+    all_debug_reports: list[DebugReport] = []
+    all_legacy_issues: list[LegacyIssue] = []
+    all_attempts: list[str] = []
     bb_test_file: Path | None = None
+
+    # Initialize rollback manager
+    rollback = RollbackManager(workspace)
+    rollback.checkpoint("pipeline_start")
 
     while retry_count < MAX_TOTAL_RETRIES:
         # ── Phase 3: Code Implementation ──
         print(f"[TDD] Phase 3: Code Implementation (attempt {retry_count + 1})")
-        code_agent = create_code_agent(llm)
-        code_conv = Conversation(agent=code_agent, workspace=str(workspace))
+        pre_code_checkpoint = rollback.checkpoint("phase3_start")
 
-        code_prompt = (
-            f"Implement the code to make all tests pass.\n\n"
-            f"Design documents: openspec/\n"
-            f"Stub files: {stub_list}\n"
-            f"Test files: {', '.join(test_files)}\n\n"
-            f"Run `pytest tests/ -v` to verify your implementation."
-        )
-        if failure_context:
-            code_prompt += f"\n\n## Previous test failures:\n{failure_context}"
+        if debug_report:
+            # Use debug-aware code agent
+            code_agent = create_code_agent_with_debug(llm)
+            code_conv = Conversation(agent=code_agent, workspace=str(workspace))
+            code_prompt = (
+                f"Implement the code to make all tests pass.\n\n"
+                f"Design documents: openspec/\n"
+                f"Stub files: {stub_list}\n"
+                f"Test files: {', '.join(test_files)}\n\n"
+                f"{debug_report.to_prompt_text()}\n\n"
+                f"Run `pytest tests/ -v` to verify your implementation."
+            )
+        else:
+            code_agent = create_code_agent(llm)
+            code_conv = Conversation(agent=code_agent, workspace=str(workspace))
+            code_prompt = (
+                f"Implement the code to make all tests pass.\n\n"
+                f"Design documents: openspec/\n"
+                f"Stub files: {stub_list}\n"
+                f"Test files: {', '.join(test_files)}\n\n"
+                f"Run `pytest tests/ -v` to verify your implementation."
+            )
 
         code_conv.send_message(code_prompt)
         code_conv.run()
+
+        # Extract finish message to check for challenges
+        finish_msg = _extract_finish_message(code_conv)
+        all_attempts.append(f"Attempt {retry_count + 1}: {finish_msg[:200]}")
+
+        rollback.checkpoint("phase3_end")
+
+        # Check if Coding Agent challenged a hypothesis
+        if debug_report and finish_msg:
+            challenge = parse_challenge_from_finish(finish_msg)
+            if challenge:
+                print(f"  [CHALLENGE] Coding Agent challenges {challenge.hypothesis_id}: {challenge.challenge_reason}")
+                challenge_count += 1
+                if challenge_count <= MAX_CHALLENGE_RETRIES:
+                    # Rollback code changes
+                    rollback.rollback_to(pre_code_checkpoint)
+                    print(f"  Rolled back to pre-code checkpoint")
+                    # Re-run debug with challenge context
+                    debug_report = _run_debug_analysis(
+                        workspace, llm, whitebox_output, challenge, all_debug_reports
+                    )
+                    continue
+                else:
+                    print(f"  Challenge retries exhausted ({MAX_CHALLENGE_RETRIES})")
 
         # ── Phase 4: White-box Verification ──
         print("[TDD] Phase 4: White-box Verification")
@@ -872,7 +1052,8 @@ def run_tdd_pipeline(
         wb_conv = Conversation(agent=wb_agent, workspace=str(workspace))
         wb_conv.send_message(
             "Run all white-box tests and report results.\n\n"
-            "Execute: `pytest tests/ -v --tb=long --ignore=tests/test_blackbox_auto.py`\n\n"
+            "Execute: `pytest tests/ -v --tb=long --ignore=tests/test_blackbox_auto.py "
+            "--ignore=tests/test_whitebox_from_bb.py --ignore=tests/test_blackbox_variants.py`\n\n"
             "Report the full output and whether all tests passed."
         )
         wb_conv.run()
@@ -882,15 +1063,25 @@ def run_tdd_pipeline(
         print(f"  White-box: {wb_result.passed} passed, {wb_result.failed} failed, {wb_result.errors} errors")
 
         if not wb_result.all_passed:
-            failure_context = f"White-box test failures:\n{whitebox_output}"
             retry_count += 1
             if retry_count >= MAX_WHITEBOX_RETRIES:
                 print(f"  White-box retries exhausted ({MAX_WHITEBOX_RETRIES})")
+                # Mark remaining failures as legacy issues
+                _mark_legacy_issues(
+                    whitebox_output, all_debug_reports, all_attempts, all_legacy_issues
+                )
                 break
+
+            # ── Phase 4.5: Debug Analysis ──
+            debug_report = _run_debug_analysis(
+                workspace, llm, whitebox_output, challenge=None,
+                all_debug_reports=all_debug_reports,
+            )
+            challenge = None
+            challenge_count = 0
             continue
 
         whitebox_passed = True
-
         # ── Phase 5: Black-box Tests ──
         if has_spec_scenarios:
             # Phase 5a: Generate real blackbox tests using an agent
@@ -926,11 +1117,37 @@ def run_tdd_pipeline(
                 print(f"  Black-box: {bb_result.passed} passed, {bb_result.failed} failed, {bb_result.errors} errors")
 
                 if not bb_result.all_passed and bb_result.failed > 0:
-                    failure_context = f"Black-box test failures:\n{blackbox_output}"
+                    # ── BB/WB Combination: expose + anti-cheat ──
+                    failing_bb_tests = _extract_failing_test_names(blackbox_output)
+                    if failing_bb_tests:
+                        print(f"  Exposing {len(failing_bb_tests)} BB tests as WB + generating variants")
+                        wb_from_bb = workspace / "tests" / "test_whitebox_from_bb.py"
+                        expose_as_whitebox(failing_bb_tests, bb_test_file, wb_from_bb)
+
+                        # Generate anti-cheat variants
+                        scenarios = _parse_spec_scenarios(
+                            spec_path.read_text(encoding="utf-8")
+                        )
+                        variant_file = workspace / "tests" / "test_blackbox_variants.py"
+                        generate_variant_tests_for_failures(
+                            failing_bb_tests, bb_test_file, scenarios, llm, variant_file
+                        )
+
+                    # Run debug analysis for BB failures
                     retry_count += 1
                     if retry_count >= MAX_TOTAL_RETRIES:
                         print(f"  Total retries exhausted ({MAX_TOTAL_RETRIES})")
+                        _mark_legacy_issues(
+                            blackbox_output, all_debug_reports, all_attempts, all_legacy_issues
+                        )
                         break
+
+                    debug_report = _run_debug_analysis(
+                        workspace, llm, blackbox_output, challenge=None,
+                        all_debug_reports=all_debug_reports,
+                    )
+                    challenge = None
+                    challenge_count = 0
                     continue
 
         blackbox_passed = True
@@ -941,7 +1158,7 @@ def run_tdd_pipeline(
     for f in workspace.rglob("*"):
         if f.is_file():
             rel = f.relative_to(workspace)
-            if not str(rel).startswith((".toyshop", "openspec", "__pycache__", ".git")):
+            if not str(rel).startswith((".toyshop", "openspec", "__pycache__", ".git", ".coverage", ".tdd_debug")):
                 files_created.append(str(rel))
 
     all_test_files = sorted(
@@ -949,12 +1166,16 @@ def run_tdd_pipeline(
     )
 
     success = whitebox_passed and blackbox_passed
+    legacy_count = len(all_legacy_issues)
     summary_parts = [
         f"TDD pipeline {'PASSED' if success else 'FAILED'}",
         f"White-box: {'PASSED' if whitebox_passed else 'FAILED'}",
         f"Black-box: {'PASSED' if blackbox_passed else 'SKIPPED' if not has_spec_scenarios else 'FAILED'}",
         f"Retries: {retry_count}",
+        f"Debug reports: {len(all_debug_reports)}",
     ]
+    if legacy_count:
+        summary_parts.append(f"Legacy issues: {legacy_count}")
 
     return TDDResult(
         success=success,
@@ -967,4 +1188,142 @@ def run_tdd_pipeline(
         blackbox_output=blackbox_output,
         summary=" | ".join(summary_parts),
         retry_count=retry_count,
+        legacy_issues=all_legacy_issues,
+        debug_reports=all_debug_reports,
     )
+
+
+# =============================================================================
+# Debug analysis helper (Phase 4.5)
+# =============================================================================
+
+def _run_debug_analysis(
+    workspace: Path,
+    llm: LLM,
+    test_output: str,
+    challenge: CodingChallenge | None,
+    all_debug_reports: list[DebugReport],
+) -> DebugReport:
+    """Run Phase 4.5: Debug Agent analyzes failures with probes and hypotheses."""
+    print("[TDD] Phase 4.5: Debug Analysis")
+
+    # Reset probe and hypothesis state for this session
+    instrumentor = get_instrumentor(workspace)
+    instrumentor.remove_all_probes()
+    reset_probe_counter()
+    hyp_manager = get_hypothesis_manager(workspace)
+    hyp_manager.reset()
+
+    rollback = RollbackManager(workspace)
+    rollback.checkpoint("debug_start")
+
+    # Build debug prompt
+    debug_prompt = (
+        f"Analyze these test failures and identify the bug.\n\n"
+        f"## Test Output\n```\n{test_output[:3000]}\n```\n\n"
+    )
+    if challenge:
+        debug_prompt += (
+            f"## IMPORTANT: Previous hypothesis was challenged\n"
+            f"Hypothesis {challenge.hypothesis_id} was challenged by the developer.\n"
+            f"Reason: {challenge.challenge_reason}\n"
+            f"Evidence: {challenge.evidence}\n\n"
+            f"You must investigate from a DIFFERENT angle. "
+            f"Do NOT repeat the same hypothesis.\n\n"
+        )
+
+    debug_prompt += (
+        "Use fault_localize, probe_tool, and hypothesis_tool to investigate.\n"
+        "Remember to remove all probes before finishing."
+    )
+
+    debug_agent = create_debug_agent(llm)
+    debug_conv = Conversation(agent=debug_agent, workspace=str(workspace))
+    debug_conv.send_message(debug_prompt)
+    debug_conv.run()
+
+    # Ensure probes are cleaned up
+    cleaned = instrumentor.remove_all_probes()
+    if cleaned > 0:
+        print(f"  Cleaned up {cleaned} probe-modified files")
+
+    rollback.checkpoint("debug_end")
+
+    # Build DebugReport from hypothesis manager state
+    active, excluded = hyp_manager.get_report()
+    finish_msg = _extract_finish_message(debug_conv)
+
+    report = DebugReport(
+        failing_tests=_extract_failing_test_names(test_output),
+        test_output=test_output[:2000],
+        hypotheses=active,
+        excluded_hypotheses=excluded,
+        recommended_fix=finish_msg[:1000] if finish_msg else "",
+    )
+
+    # Add fault localization data if available
+    try:
+        localizer = FaultLocalizer(workspace)
+        suspicious = localizer.localize(top_n=10)
+        report.fault_localization = [
+            {"file": s.file, "line": s.line, "score": s.score}
+            for s in suspicious
+        ]
+    except Exception:
+        pass
+
+    all_debug_reports.append(report)
+    print(f"  Hypotheses: {len(active)} active, {len(excluded)} excluded")
+    return report
+
+
+def _extract_finish_message(conversation: Conversation) -> str:
+    """Extract the finish message from a conversation."""
+    from openhands.sdk.event import ActionEvent
+    from openhands.sdk.tool.builtins.finish import FinishAction
+
+    try:
+        for event in conversation.state.events:
+            if isinstance(event, ActionEvent) and isinstance(event.action, FinishAction):
+                return event.action.message or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_failing_test_names(test_output: str) -> list[str]:
+    """Extract failing test names from pytest output."""
+    failing = []
+    for line in test_output.split("\n"):
+        if "FAILED" in line:
+            parts = line.strip().split()
+            for part in parts:
+                if "::" in part and "test_" in part:
+                    func_name = part.split("::")[-1]
+                    failing.append(func_name)
+                    break
+    return failing
+
+
+def _mark_legacy_issues(
+    test_output: str,
+    debug_reports: list[DebugReport],
+    attempts: list[str],
+    legacy_issues: list[LegacyIssue],
+) -> None:
+    """Mark remaining test failures as legacy issues."""
+    failing = _extract_failing_test_names(test_output)
+    all_hypotheses: list[DebugHypothesis] = []
+    for report in debug_reports:
+        all_hypotheses.extend(report.hypotheses)
+        all_hypotheses.extend(report.excluded_hypotheses)
+
+    for test_name in failing:
+        issue = mark_as_legacy(
+            test_name=test_name,
+            description=f"Test {test_name} failed after all retry attempts",
+            attempts=attempts,
+            hypotheses=all_hypotheses,
+            recommendation="Requires manual investigation",
+        )
+        legacy_issues.append(issue)
