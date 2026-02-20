@@ -1,0 +1,15 @@
+pyproject.toml
+toyshop/__init__.py
+toyshop/llm.py
+toyshop.egg-info/PKG-INFO
+toyshop.egg-info/SOURCES.txt
+toyshop.egg-info/dependency_links.txt
+toyshop.egg-info/requires.txt
+toyshop.egg-info/top_level.txt
+toyshop/openspec/__init__.py
+toyshop/openspec/generator.py
+toyshop/openspec/parser.py
+toyshop/openspec/types.py
+toyshop/openspec/validator.py
+toyshop/storage/__init__.py
+toyshop/workflows/__init__.py
