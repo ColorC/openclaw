@@ -1,0 +1,85 @@
+{
+  "id": "toyshop",
+  "name": "ToyShop",
+  "description": "Low-supervision software factory: Development, Maintenance, and Iteration pipelines with OpenSpec contracts",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxRetries": {
+        "type": "number",
+        "description": "Maximum retry attempts for pipeline nodes",
+        "default": 3
+      },
+      "retryDelayBase": {
+        "type": "number",
+        "description": "Base delay in ms for exponential backoff",
+        "default": 1000
+      },
+      "defaultTimeout": {
+        "type": "number",
+        "description": "Default timeout in milliseconds for pipeline execution",
+        "default": 600000
+      },
+      "enableCheckpoint": {
+        "type": "boolean",
+        "description": "Enable workflow state checkpointing",
+        "default": true
+      },
+      "checkpointPath": {
+        "type": "string",
+        "description": "Path to store checkpoints (relative to workspace)",
+        "default": ".toyshop/checkpoints"
+      },
+      "architectureDbPath": {
+        "type": "string",
+        "description": "Path to architecture database (relative to workspace)",
+        "default": ".toyshop/architecture.db"
+      },
+      "openspecDir": {
+        "type": "string",
+        "description": "Directory for OpenSpec documents (relative to workspace)",
+        "default": "openspec"
+      },
+      "sourceDir": {
+        "type": "string",
+        "description": "Source code directory (relative to workspace)",
+        "default": "src"
+      }
+    }
+  },
+  "uiHints": {
+    "maxRetries": {
+      "label": "Max Retries",
+      "help": "Maximum number of retry attempts when a pipeline node fails"
+    },
+    "retryDelayBase": {
+      "label": "Retry Delay Base (ms)",
+      "help": "Base delay for exponential backoff retry strategy"
+    },
+    "defaultTimeout": {
+      "label": "Default Timeout (ms)",
+      "help": "Default timeout for pipeline execution (10 minutes = 600000ms)"
+    },
+    "enableCheckpoint": {
+      "label": "Enable Checkpointing",
+      "help": "Save workflow state to allow resuming interrupted pipelines"
+    },
+    "checkpointPath": {
+      "label": "Checkpoint Path",
+      "help": "Directory to store workflow checkpoints"
+    },
+    "architectureDbPath": {
+      "label": "Architecture DB Path",
+      "help": "SQLite database file for architecture snapshots"
+    },
+    "openspecDir": {
+      "label": "OpenSpec Directory",
+      "help": "Directory for OpenSpec documents (proposal.md, design.md, etc.)"
+    },
+    "sourceDir": {
+      "label": "Source Directory",
+      "help": "Source code directory for generated code"
+    }
+  }
+}

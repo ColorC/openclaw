@@ -1,0 +1,75 @@
+/**
+ * LLM Nodes — 导出
+ *
+ * 将所有 LLM 驱动的节点工厂函数统一导出。
+ * 这些节点通过 ModelProvider + PromptRegistry 调用 LLM，
+ * 替换各工作流中的 stub 实现。
+ */
+
+// Decomposition nodes
+export { createDecomposeNode, createInvestScoringNode } from "./decomposition-nodes.js";
+export type { DecompositionNodeDeps } from "./decomposition-nodes.js";
+
+// Architecture nodes
+export {
+  createAnalyzeRequirementNode,
+  createListFeaturesNode,
+  createSelectPatternNode,
+  createDesignDomainsNode,
+  createDesignModulesNode,
+  createDefineInterfacesNode,
+  createDesignDataModelNode,
+  createDesignApiEndpointsNode,
+  createDesignReviewNode,
+  createValidateArchitectureNode,
+  createRefineDesignNode,
+  createDesignFileStructureNode,
+  createGenerateOpenspecNode,
+} from "./architecture-nodes.js";
+export type { ArchitectureNodeDeps } from "./architecture-nodes.js";
+
+// Coder nodes
+export { createRecursiveCoderNode, createHandleArgueNode } from "./coder-nodes.js";
+export type { CoderNodeDeps } from "./coder-nodes.js";
+
+// Native Coder node (pi-coding-agent tools + Agent Runner)
+export { createNativeCoderNode } from "./native-coder-node.js";
+export type { NativeCoderNodeDeps } from "./native-coder-node.js";
+
+// Claude Code CLI Coder node
+export { createClaudeCodeCoderNode } from "./claude-code-coder-node.js";
+export type { ClaudeCodeCoderNodeDeps } from "./claude-code-coder-node.js";
+
+// Requirement Clarification nodes
+export {
+  createRequirementClarificationNode,
+  createCollectedInfo,
+  deserializeCollectedInfo,
+  formatCollectedInfo,
+  formatExistingRequirementsContext,
+  generateOpenSpecProposal,
+  generateOpenSpecChangeProposal,
+} from "./requirement-clarification-nodes.js";
+export type {
+  RequirementClarificationNodeDeps,
+  CollectedInfo,
+} from "./requirement-clarification-nodes.js";
+
+// OpenSpec generators
+export {
+  generateDesignMarkdown,
+  generateArchitectureTasksMarkdown,
+  generateSpecMarkdown,
+  generateDeltaDesignMarkdown,
+  generateDeltaTasksMarkdown,
+  generateDeltaSpecMarkdown,
+} from "./openspec-generators.js";
+
+// Incremental design nodes
+export {
+  createLoadExistingContextNode,
+  createAnalyzeChangeImpactNode,
+  createDesignDeltaNode,
+  applyDelta,
+} from "./incremental-nodes.js";
+export type { IncrementalNodeDeps } from "./incremental-nodes.js";
