@@ -28,6 +28,12 @@ from toyshop.coding_agent import (
     CodingResult,
 )
 
+# TDD Pipeline
+from toyshop.tdd_pipeline import (
+    run_tdd_pipeline,
+    TDDResult,
+)
+
 __all__ = [
     # Legacy
     "create_llm",
@@ -49,4 +55,7 @@ __all__ = [
     "run_coding_workflow",
     "run_full_pipeline_with_coding",
     "CodingResult",
+    # TDD Pipeline
+    "run_tdd_pipeline",
+    "TDDResult",
 ]

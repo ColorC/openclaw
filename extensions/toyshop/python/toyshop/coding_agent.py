@@ -342,6 +342,7 @@ def run_full_pipeline_with_coding(
     llm: LLM | None = None,
     language: str = "python",
     run_tests: bool = True,
+    tdd_mode: bool = False,
 ) -> dict[str, Any]:
     """Run the complete pipeline: design → code → test.
 
@@ -352,6 +353,7 @@ def run_full_pipeline_with_coding(
         llm: LLM instance
         language: Target language
         run_tests: Whether to run tests
+        tdd_mode: If True, use TDD pipeline (test-first) instead of standard coding
 
     Returns:
         Dictionary with all pipeline results
@@ -389,19 +391,34 @@ def run_full_pipeline_with_coding(
 
     # Phase 2: Coding
     print("\n" + "=" * 60)
-    print("Phase 2: Coding")
+    print(f"Phase 2: {'TDD Pipeline' if tdd_mode else 'Coding'}")
     print("=" * 60)
 
-    coding_result = run_coding_workflow(
-        workspace=workspace,
-        llm=llm,
-        language=language,
-    )
-
-    results["coding"] = {
-        "files_created": coding_result.files_created,
-        "summary": coding_result.summary,
-    }
+    if tdd_mode:
+        from toyshop.tdd_pipeline import run_tdd_pipeline
+        tdd_result = run_tdd_pipeline(
+            workspace=workspace,
+            llm=llm,
+            language=language,
+        )
+        results["coding"] = {
+            "files_created": tdd_result.files_created,
+            "test_files": tdd_result.test_files,
+            "whitebox_passed": tdd_result.whitebox_passed,
+            "blackbox_passed": tdd_result.blackbox_passed,
+            "summary": tdd_result.summary,
+            "retry_count": tdd_result.retry_count,
+        }
+    else:
+        coding_result = run_coding_workflow(
+            workspace=workspace,
+            llm=llm,
+            language=language,
+        )
+        results["coding"] = {
+            "files_created": coding_result.files_created,
+            "summary": coding_result.summary,
+        }
 
     # Phase 3: UX Evaluation (optional)
     if run_tests:
