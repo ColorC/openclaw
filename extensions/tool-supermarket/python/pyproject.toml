@@ -1,0 +1,9 @@
+[project]
+name = "tool-supermarket"
+version = "0.1.0"
+description = "Dynamic tool discovery for AI agents"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
