@@ -4,6 +4,7 @@ Pipeline flow:
   Phase 1: Signature Extraction (pure Python, no agent)
   Phase 2: Test Generation (Test Agent - write mode, restricted to tests/)
   Phase 3: Code Implementation (Code Agent - blocked from tests/)
+  Phase 3.5: Test Fix (Test Agent - fix mode, if code agent hit boundary violation)
   Phase 4: White-box Verification (Test Agent - verify mode, read-only)
   Phase 4.5: Debug Analysis (Debug Agent - probes, fault localization, hypotheses)
   Phase 5: Black-box Verification (auto-generated from spec.md scenarios)
@@ -12,6 +13,10 @@ Pipeline flow:
 Key design: agents have different tool permissions enforced at the executor level,
 not just via prompt instructions. Debug Agent uses hypothesis-driven debugging with
 diagnostic probes and SBFL fault localization.
+
+Cross-boundary violations: when an agent tries to edit files outside its allowed
+directories, the violation is detected and the request is re-routed to the
+appropriate agent (e.g., code agent -> test fix agent for test bugs).
 """
 
 from __future__ import annotations
@@ -132,6 +137,55 @@ class TDDResult:
     legacy_issues: list[LegacyIssue] = field(default_factory=list)
     debug_reports: list[DebugReport] = field(default_factory=list)
     verdicts: list[TestVerdict] = field(default_factory=list)
+
+
+@dataclass
+class BoundaryViolation:
+    """Detected when an agent tries to write outside its allowed directories."""
+    agent_role: str       # "code" or "test"
+    target_path: str      # file the agent tried to edit
+    agent_reasoning: str  # finish message explaining why
+
+
+def _detect_boundary_violations(
+    conversation: Conversation, agent_role: str,
+) -> list[BoundaryViolation]:
+    """Scan conversation events for blocked write operations.
+
+    Returns a list of BoundaryViolation if the agent tried to edit files
+    outside its allowed directories (detected via FileEditorObservation errors).
+    """
+    from openhands.sdk.event import ObservationEvent
+
+    violations: list[BoundaryViolation] = []
+    seen_paths: set[str] = set()
+
+    finish_msg = _extract_finish_message(conversation)
+
+    for event in conversation.state.events:
+        if not isinstance(event, ObservationEvent):
+            continue
+        # Check for blocked write error messages from DirectoryRestrictedFileEditorExecutor
+        text = ""
+        if hasattr(event, "observation") and hasattr(event.observation, "content"):
+            for item in event.observation.content:
+                if hasattr(item, "text"):
+                    text += item.text
+        if not text:
+            continue
+        # Match: "Write operation 'xxx' blocked on '/path/to/file'."
+        m = re.search(r"Write operation '[^']+' blocked on '([^']+)'", text)
+        if m:
+            path = m.group(1)
+            if path not in seen_paths:
+                seen_paths.add(path)
+                violations.append(BoundaryViolation(
+                    agent_role=agent_role,
+                    target_path=path,
+                    agent_reasoning=finish_msg[:2000],
+                ))
+
+    return violations
 
 
 # =============================================================================
@@ -481,6 +535,9 @@ TEST_AGENT_WRITE_PROMPT = """You are a test engineer. Write comprehensive pytest
 - Use descriptive test names: test_<feature>_<scenario>
 - Include both happy-path and error-handling tests
 - Use pytest fixtures where appropriate
+- If you believe IMPLEMENTATION CODE has a bug, do NOT try to edit it.
+  Instead, explain in your finish message what is wrong and why.
+  The system will route your request to the coding agent for fixing.
 
 When done, call finish with a summary of test files created.
 """
@@ -501,6 +558,9 @@ TDD_CODE_AGENT_PROMPT = """You are an expert developer. Implement code to make a
 - Run `pytest tests/ -v` to check progress
 - Keep implementations clean and follow the design document
 - Handle edge cases as specified in the tests
+- If you believe a TEST has a bug (wrong data, contradictory logic), do NOT try to edit it.
+  Instead, explain in your finish message what is wrong with the test and why.
+  The system will route your request to the test agent for fixing.
 
 When done, call finish with a summary of what was implemented and test results.
 """
@@ -520,6 +580,9 @@ BLACKBOX_TEST_AGENT_PROMPT = """You are a black-box test engineer. Write executa
 - Import the actual modules and call the real API
 - Each test must have real assertions that verify the Then condition
 - Do NOT use pytest.skip() — every test must run and assert something
+- If you believe IMPLEMENTATION CODE has a bug, do NOT try to edit it.
+  Instead, explain in your finish message what is wrong and why.
+  The system will route your request to the coding agent for fixing.
 
 When done, call finish with a summary of tests created.
 """
@@ -559,6 +622,9 @@ You have received a Debug Report with hypotheses about the bug. Follow these hyp
 - Do NOT change function/class signatures
 - Address the hypotheses — don't ignore them
 - If you challenge a hypothesis, provide CLEAR evidence
+- If you believe a TEST has a bug (wrong data, contradictory logic), do NOT try to edit it.
+  Instead, explain in your finish message what is wrong with the test and why.
+  The system will route your request to the test agent for fixing.
 
 When done, call finish with a summary and test results.
 """
@@ -605,6 +671,24 @@ DEBUG_AGENT_PROMPT = """You are a debug analyst. Analyze test failures using sci
 - Provide clear reasoning for each status change
 
 When done, call finish with your analysis summary.
+"""
+
+TEST_AGENT_FIX_PROMPT = """You are a test engineer. Fix test issues identified by debug analysis.
+
+## Context
+The debug analysis found that certain test failures are caused by issues in the
+test code itself, not in the implementation. The coding agent attempted to fix
+the tests but was blocked because it cannot edit files under tests/.
+
+## Your Workflow
+1. Read the Debug Report and boundary violation context carefully
+2. Read the affected test files and the implementation code
+3. Fix the test issues — preserve the TEST INTENT but fix the test DATA or LOGIC
+4. Run `pytest tests/ -v` to verify your fixes don't break other tests
+5. Do NOT modify any files outside the tests/ directory
+6. Do NOT weaken tests — fix bugs in test data/logic, don't remove assertions
+
+When done, call finish with a summary of what was fixed.
 """
 
 
@@ -654,6 +738,21 @@ def create_blackbox_test_agent(llm: LLM) -> Agent:
         ],
         include_default_tools=["FinishTool"],
         system_prompt_kwargs={"custom_prompt": BLACKBOX_TEST_AGENT_PROMPT},
+    )
+
+
+def create_test_agent_fix(llm: LLM) -> Agent:
+    """Create Test Agent in fix mode — can edit tests/ to fix test bugs."""
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "test_file_editor"},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": TEST_AGENT_FIX_PROMPT},
     )
 
 
@@ -947,6 +1046,12 @@ def run_tdd_pipeline(
     )
     test_conv.run()
 
+    # Check if test agent tried to edit business code
+    test_violations = _detect_boundary_violations(test_conv, "test")
+    if test_violations:
+        code_paths = [v.target_path for v in test_violations]
+        print(f"  [BOUNDARY] Test agent attempted to edit code file(s): {code_paths}")
+
     # Collect test files
     test_dir = workspace / "tests"
     test_files = sorted(
@@ -1046,6 +1151,32 @@ def run_tdd_pipeline(
                 else:
                     print(f"  Challenge retries exhausted ({MAX_CHALLENGE_RETRIES})")
 
+        # ── Phase 3.5: Boundary violation detection ──
+        # If code agent tried to edit tests/, re-route to test fix agent
+        violations = _detect_boundary_violations(code_conv, "code")
+        if violations:
+            test_paths = [v.target_path for v in violations]
+            print(f"  [BOUNDARY] Code agent attempted to edit test file(s): {test_paths}")
+            print("[TDD] Phase 3.5: Test Fix (re-routing to test agent)")
+
+            test_fix_agent = create_test_agent_fix(llm)
+            test_fix_conv = Conversation(agent=test_fix_agent, workspace=str(workspace))
+
+            violation_context = "\n".join(
+                f"- Tried to edit: {v.target_path}" for v in violations
+            )
+            fix_prompt = (
+                f"Fix test issues identified by debug analysis.\n\n"
+                f"## Debug Report\n"
+                f"{debug_report.to_prompt_text() if debug_report else 'No debug report available.'}\n\n"
+                f"## What the coding agent wanted to change\n{violation_context}\n\n"
+                f"## Coding agent's reasoning\n{finish_msg[:2000]}\n\n"
+                f"Design documents: openspec/\n"
+                f"Run `pytest tests/ -v` to verify after fixing."
+            )
+            test_fix_conv.send_message(fix_prompt)
+            test_fix_conv.run()
+
         # ── Phase 4: White-box Verification ──
         print("[TDD] Phase 4: White-box Verification")
         wb_agent = create_test_agent_verify(llm)
@@ -1097,6 +1228,12 @@ def run_tdd_pipeline(
                 "Run `pytest tests/test_blackbox_auto.py -v` to verify they pass."
             )
             bb_write_conv.run()
+
+            # Check if blackbox test agent tried to edit business code
+            bb_violations = _detect_boundary_violations(bb_write_conv, "test")
+            if bb_violations:
+                code_paths = [v.target_path for v in bb_violations]
+                print(f"  [BOUNDARY] Blackbox test agent attempted to edit code file(s): {code_paths}")
 
             bb_test_file = workspace / "tests" / "test_blackbox_auto.py"
 
