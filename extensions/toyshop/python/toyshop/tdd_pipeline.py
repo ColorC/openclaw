@@ -594,8 +594,12 @@ def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def extract_signatures(workspace: Path) -> SignatureManifest:
+def extract_signatures(workspace: Path, mode: str = "create") -> SignatureManifest:
     """Parse openspec/design.md and generate stub files.
+
+    Args:
+        workspace: Project workspace directory
+        mode: "create" overwrites stubs; "modify" preserves existing code files
 
     Returns a SignatureManifest with paths to generated stubs.
     """
@@ -635,7 +639,14 @@ def extract_signatures(workspace: Path) -> SignatureManifest:
 
     # Ensure parent directory exists
     stub_path.parent.mkdir(parents=True, exist_ok=True)
-    stub_path.write_text(stub_code, encoding="utf-8")
+
+    if mode == "modify" and stub_path.exists():
+        # In modify mode, preserve existing code — don't overwrite with stubs.
+        # The existing file has real implementations that we want to keep.
+        # Just record it as the stub file for reference.
+        pass
+    else:
+        stub_path.write_text(stub_code, encoding="utf-8")
 
     # Create __init__.py if needed
     init_path = stub_path.parent / "__init__.py"
@@ -681,6 +692,84 @@ TEST_AGENT_WRITE_PROMPT = """You are a test engineer. Write comprehensive pytest
   The system will route your request to the coding agent for fixing.
 
 When done, call finish with a summary of test files created.
+"""
+
+# --- Modify-mode prompt variants ---
+
+TEST_AGENT_WRITE_MODIFY_PROMPT = """You are a test engineer. Write additional pytest tests for CHANGED and NEW interfaces only.
+
+## Context
+This is a MODIFY operation on an existing codebase. Existing tests already cover unchanged interfaces.
+You must preserve all existing test files and only ADD new tests for the changed parts.
+
+## Your Workflow
+1. Read openspec/design.md and openspec/spec.md to understand the CHANGES
+2. Read existing test files in tests/ to understand what's already covered
+3. Read the stub/code files to understand new/changed function signatures
+4. Write NEW test files for changed interfaces (e.g. tests/test_<feature>_change.py)
+5. Do NOT modify existing test files unless they import changed signatures
+
+## Rules
+- ONLY create/edit files under the tests/ directory
+- Do NOT implement any production code
+- PRESERVE all existing test files — do not delete or rewrite them
+- Focus on testing NEW and CHANGED interfaces only
+- Use descriptive test names: test_<feature>_<scenario>
+- Include both happy-path and error-handling tests for new functionality
+- If you believe IMPLEMENTATION CODE has a bug, do NOT try to edit it.
+  Instead, explain in your finish message what is wrong and why.
+
+When done, call finish with a summary of test files created/modified.
+"""
+
+TDD_CODE_AGENT_MODIFY_PROMPT = """You are an expert developer. Modify existing code to make all tests pass.
+
+## Context
+This is a MODIFY operation on an existing codebase. You must make targeted edits to existing files.
+Do NOT rewrite files from scratch — make surgical changes.
+
+## Your Workflow
+1. Read the test files in tests/ to understand expected behavior (both old and new)
+2. Read the existing implementation code to understand current structure
+3. Read openspec/design.md for the change design
+4. Make targeted modifications to existing files to satisfy new tests
+5. Create new files ONLY when the design explicitly requires new modules
+6. Run `pytest tests/ -v` after each significant change
+7. Fix failures iteratively until ALL tests pass (both existing and new)
+
+## Rules
+- Do NOT modify any files in the tests/ directory
+- Do NOT change existing function/class signatures unless the design explicitly requires it
+- NEVER rewrite a file from scratch — make targeted edits
+- Preserve existing code style, naming conventions, and patterns
+- Run `pytest tests/ -v` to check progress — ALL tests must pass (regression + new)
+- If you believe a TEST has a bug, explain in your finish message what is wrong.
+
+When done, call finish with a summary of what was modified and test results.
+"""
+
+BLACKBOX_TEST_AGENT_MODIFY_PROMPT = """You are a black-box test engineer. Write executable pytest tests for CHANGED and NEW spec.md scenarios only.
+
+## Context
+This is a MODIFY operation. Existing blackbox tests cover unchanged scenarios.
+Only write tests for new or changed scenarios.
+
+## Your Workflow
+1. Read openspec/spec.md to find NEW and CHANGED Given/When/Then scenarios
+2. Read existing tests/test_blackbox_auto.py (if it exists) to see what's already covered
+3. Read the implementation code to understand how to import and call the public API
+4. Add new test functions to tests/test_blackbox_auto.py for changed/new scenarios
+5. Tests must be REAL executable tests with actual assertions
+
+## Rules
+- ONLY create/edit files under the tests/ directory
+- PRESERVE existing blackbox tests — only ADD new ones
+- Test from the USER's perspective — treat the code as a black box
+- Each test must have real assertions that verify the Then condition
+- Do NOT use pytest.skip()
+- If you believe IMPLEMENTATION CODE has a bug, explain in your finish message.
+
+When done, call finish with a summary of tests created.
 """
 
 TDD_CODE_AGENT_PROMPT = """You are an expert developer. Implement code to make all tests pass.
@@ -837,8 +926,9 @@ When done, call finish with a summary of what was fixed.
 # Agent creation
 # =============================================================================
 
-def create_test_agent_write(llm: LLM) -> Agent:
+def create_test_agent_write(llm: LLM, mode: str = "create") -> Agent:
     """Create Test Agent in write mode — can only write under tests/."""
+    prompt = TEST_AGENT_WRITE_MODIFY_PROMPT if mode == "modify" else TEST_AGENT_WRITE_PROMPT
     return Agent(
         llm=llm,
         tools=[
@@ -848,12 +938,13 @@ def create_test_agent_write(llm: LLM) -> Agent:
             {"name": "grep"},
         ],
         include_default_tools=["FinishTool"],
-        system_prompt_kwargs={"custom_prompt": TEST_AGENT_WRITE_PROMPT},
+        system_prompt_kwargs={"custom_prompt": prompt},
     )
 
 
-def create_code_agent(llm: LLM) -> Agent:
+def create_code_agent(llm: LLM, mode: str = "create") -> Agent:
     """Create Code Agent — can write everywhere except tests/."""
+    prompt = TDD_CODE_AGENT_MODIFY_PROMPT if mode == "modify" else TDD_CODE_AGENT_PROMPT
     return Agent(
         llm=llm,
         tools=[
@@ -863,12 +954,13 @@ def create_code_agent(llm: LLM) -> Agent:
             {"name": "grep"},
         ],
         include_default_tools=["FinishTool"],
-        system_prompt_kwargs={"custom_prompt": TDD_CODE_AGENT_PROMPT},
+        system_prompt_kwargs={"custom_prompt": prompt},
     )
 
 
-def create_blackbox_test_agent(llm: LLM) -> Agent:
+def create_blackbox_test_agent(llm: LLM, mode: str = "create") -> Agent:
     """Create agent to write real blackbox tests from spec.md scenarios."""
+    prompt = BLACKBOX_TEST_AGENT_MODIFY_PROMPT if mode == "modify" else BLACKBOX_TEST_AGENT_PROMPT
     return Agent(
         llm=llm,
         tools=[
@@ -878,7 +970,7 @@ def create_blackbox_test_agent(llm: LLM) -> Agent:
             {"name": "grep"},
         ],
         include_default_tools=["FinishTool"],
-        system_prompt_kwargs={"custom_prompt": BLACKBOX_TEST_AGENT_PROMPT},
+        system_prompt_kwargs={"custom_prompt": prompt},
     )
 
 
@@ -1164,9 +1256,11 @@ def run_tdd_pipeline(
 
     # ── Phase 1: Signature Extraction ──
     print("[TDD] Phase 1: Signature Extraction")
-    manifest = extract_signatures(workspace)
+    manifest = extract_signatures(workspace, mode=mode)
     print(f"  Stubs: {manifest.stub_files}")
     print(f"  Interfaces: {len(manifest.interfaces)}")
+    if mode == "modify":
+        print(f"  Mode: modify (preserving existing code)")
 
     if not manifest.interfaces:
         return TDDResult(
@@ -1177,14 +1271,22 @@ def run_tdd_pipeline(
 
     # ── Phase 2: Test Generation ──
     print("[TDD] Phase 2: Test Generation (Test Agent — write mode)")
-    test_agent = create_test_agent_write(llm)
+    test_agent = create_test_agent_write(llm, mode=mode)
     test_conv = Conversation(agent=test_agent, workspace=str(workspace))
 
     stub_list = "\n".join(f"  - {f}" for f in manifest.stub_files)
+    modify_hint = ""
+    if mode == "modify":
+        modify_hint = (
+            "\nThis is a MODIFY operation. Existing tests cover unchanged interfaces.\n"
+            "Only write tests for NEW and CHANGED interfaces as described in the design docs.\n"
+            "Preserve all existing test files.\n"
+        )
     test_conv.send_message(
         f"Write comprehensive pytest tests for this project.\n\n"
         f"Design documents are in openspec/ directory.\n"
-        f"Stub files with signatures:\n{stub_list}\n\n"
+        f"Stub files with signatures:\n{stub_list}\n"
+        f"{modify_hint}\n"
         f"Create test files in the tests/ directory."
     )
     test_conv.run()
@@ -1250,22 +1352,36 @@ def run_tdd_pipeline(
             # Use debug-aware code agent
             code_agent = create_code_agent_with_debug(llm)
             code_conv = Conversation(agent=code_agent, workspace=str(workspace))
+            modify_hint = ""
+            if mode == "modify":
+                modify_hint = (
+                    "\nThis is a MODIFY operation. Make targeted edits to existing files.\n"
+                    "Do NOT rewrite files from scratch. ALL tests must pass (existing + new).\n"
+                )
             code_prompt = (
                 f"Implement the code to make all tests pass.\n\n"
                 f"Design documents: openspec/\n"
                 f"Stub files: {stub_list}\n"
-                f"Test files: {', '.join(test_files)}\n\n"
+                f"Test files: {', '.join(test_files)}\n"
+                f"{modify_hint}\n"
                 f"{debug_report.to_prompt_text()}\n\n"
                 f"Run `pytest tests/ -v` to verify your implementation."
             )
         else:
-            code_agent = create_code_agent(llm)
+            code_agent = create_code_agent(llm, mode=mode)
             code_conv = Conversation(agent=code_agent, workspace=str(workspace))
+            modify_hint = ""
+            if mode == "modify":
+                modify_hint = (
+                    "\nThis is a MODIFY operation. Make targeted edits to existing files.\n"
+                    "Do NOT rewrite files from scratch. ALL tests must pass (existing + new).\n"
+                )
             code_prompt = (
                 f"Implement the code to make all tests pass.\n\n"
                 f"Design documents: openspec/\n"
                 f"Stub files: {stub_list}\n"
-                f"Test files: {', '.join(test_files)}\n\n"
+                f"Test files: {', '.join(test_files)}\n"
+                f"{modify_hint}\n"
                 f"Run `pytest tests/ -v` to verify your implementation."
             )
 
@@ -1368,14 +1484,21 @@ def run_tdd_pipeline(
         if has_spec_scenarios:
             # Phase 5a: Generate real blackbox tests using an agent
             print("[TDD] Phase 5a: Black-box Test Generation (agent writes from spec.md)")
-            bb_write_agent = create_blackbox_test_agent(llm)
+            bb_write_agent = create_blackbox_test_agent(llm, mode=mode)
             bb_write_conv = Conversation(agent=bb_write_agent, workspace=str(workspace))
+            modify_hint = ""
+            if mode == "modify":
+                modify_hint = (
+                    "\nThis is a MODIFY operation. Only write tests for NEW and CHANGED scenarios.\n"
+                    "Preserve existing blackbox tests.\n"
+                )
             bb_write_conv.send_message(
                 "Write executable black-box tests from the spec.md scenarios.\n\n"
                 "Read openspec/spec.md for the Given/When/Then scenarios.\n"
                 "Read the implementation code to understand how to import modules.\n\n"
                 "Create tests/test_blackbox_auto.py with one test per scenario.\n"
                 "Each test must have REAL assertions — no pytest.skip().\n"
+                f"{modify_hint}"
                 "Run `pytest tests/test_blackbox_auto.py -v` to verify they pass."
             )
             bb_write_conv.run()
