@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -64,6 +65,13 @@ from toyshop.debug_hypothesis import (
     ProbeEvidence,
     get_hypothesis_manager,
     parse_challenge_from_finish,
+    # v2 Debug Form system
+    DebugForm,
+    DebugFormSet,
+    Rejection,
+    parse_rejection_from_finish,
+    get_debug_form_executor,
+    reset_debug_form_executor,
 )
 from toyshop.test_combination import (
     expose_as_whitebox,
@@ -94,10 +102,22 @@ MAX_BLACKBOX_RETRIES = 2
 MAX_TOTAL_RETRIES = 5
 MAX_CHALLENGE_RETRIES = 2  # max times Coding Agent can challenge hypotheses
 
+# v2 Debug Form flow constants
+MAX_DEBUG_FORM_RETRIES = 3   # max outer debug loop iterations
+MAX_REJECTION_RETRIES = 2    # max Code Agent → Test Agent rejection ping-pongs
+
 
 # =============================================================================
 # Result types
 # =============================================================================
+
+@dataclass
+class PerTestResult:
+    """Individual test result from automated test run."""
+    test_id: str           # e.g. "tests/test_calc.py::test_add"
+    status: str            # "passed" | "failed" | "error" | "skipped"
+    failure_message: str = ""
+
 
 @dataclass
 class TestRunResult:
@@ -108,6 +128,7 @@ class TestRunResult:
     failed: int
     errors: int
     output: str
+    per_test: list[PerTestResult] = field(default_factory=list)
 
 
 @dataclass
@@ -922,6 +943,143 @@ When done, call finish with a summary of what was fixed.
 """
 
 
+# --- New flow prompts (v2 — Debug Form architecture) ---
+
+TDD_CODE_AGENT_SMOKE_PROMPT = """You are an expert developer. Implement code based on design documents and stub signatures.
+
+## Your Workflow
+1. Read openspec/design.md for architecture and interface definitions
+2. Read the stub files to understand required signatures
+3. You may READ test files in tests/ to understand expected behavior — but you CANNOT edit or run them
+4. Implement the code — fill in the stubs with real implementations
+5. Your ONLY verification is a smoke test: import the module and print "ok"
+6. Do NOT run pytest. Do NOT modify test files.
+
+## Rules
+- Do NOT modify any files in the tests/ directory
+- Do NOT run `pytest` — you are not allowed to run tests
+- Do NOT change function/class signatures — they are contracts
+- Keep implementations clean and follow the design document
+- Handle edge cases as you understand them from reading tests and design docs
+- After implementing, run the smoke test command provided in the task message
+
+When done, call finish with a summary of what was implemented.
+"""
+
+TDD_CODE_AGENT_SMOKE_MODIFY_PROMPT = """You are an expert developer. Modify existing code based on design changes.
+
+## Context
+This is a MODIFY operation on an existing codebase. Make targeted edits to existing files.
+
+## Your Workflow
+1. Read openspec/design.md for the change design
+2. Read existing implementation code to understand current structure
+3. You may READ test files in tests/ to understand expected behavior — but you CANNOT edit or run them
+4. Make targeted modifications to existing files to satisfy the design changes
+5. Create new files ONLY when the design explicitly requires new modules
+6. Your ONLY verification is a smoke test: import the module and print "ok"
+7. Do NOT run pytest. Do NOT modify test files.
+
+## Rules
+- Do NOT modify any files in the tests/ directory
+- Do NOT run `pytest` — you are not allowed to run tests
+- NEVER rewrite a file from scratch — make targeted edits
+- Preserve existing code style, naming conventions, and patterns
+- After implementing, run the smoke test command provided in the task message
+
+When done, call finish with a summary of what was modified.
+"""
+
+TEST_AGENT_ANALYST_PROMPT = """You are a test failure analyst. Analyze test failures by filling structured Debug Forms.
+
+## Context
+The Coding Agent has written implementation code. All tests have been run automatically.
+You are receiving the full test results. Your job is to analyze each failure and fill a Debug Form.
+
+## Your Workflow
+1. Read the test results carefully — understand which tests failed and why
+2. Read the implementation code to understand what it actually does
+3. Read the test source code to understand what each failing test expects
+4. For each failing test, use `debug_form_tool` command="fill" to create a Debug Form:
+   - test_id: the full test identifier
+   - assertion_value: what was expected vs what was actual (e.g. "expected 3, got 3.0")
+   - assertion_meaning: what this assertion is semantically checking
+   - actual_situation: what the code actually does based on your reading
+   - guessed_cause: (REQUIRED) your hypothesis about WHY it fails
+   - surface_clues: observable symptoms
+   - log_clues: evidence from test output
+5. If many tests fail with the SAME root cause, use command="batch_fill":
+   - batch_pattern: a regex matching the failing test names
+   - batch_test_ids: comma-separated list of all affected test IDs
+   - Fill the form once — it applies to all matched tests
+6. If you believe YOUR OWN TEST is wrong (contradictory logic, impossible assertion),
+   use command="flag_test_bug" to mark it
+7. When all forms are filled, use command="submit" to finalize
+
+## Rules
+- Do NOT modify any files — you are read-only
+- The `guessed_cause` field is REQUIRED for every form — you MUST hypothesize
+- Use batch_fill when 3+ tests fail for the same reason — don't fill 50 individual forms
+- Be honest: if a test looks wrong, flag it as a test bug
+- Read BOTH the test code AND the implementation before guessing
+
+When done, call finish with a summary of your analysis.
+"""
+
+TDD_CODE_AGENT_DEBUG_FIX_PROMPT = """You are an expert developer. Fix code based on structured Debug Forms from the test analyst.
+
+## Context
+You received Debug Forms analyzing test failures. Each form contains:
+- What the test expected vs what happened
+- A hypothesis about why it fails
+- Evidence and clues
+
+## Your Workflow
+1. Read the Debug Forms carefully
+2. For each form, judge if the hypothesis is reasonable:
+   a. If reasonable: modify your code to fix the issue, then run the specific failing test to verify
+   b. If the test itself is flagged as a potential bug: note it but still try to fix code first
+3. Run failing tests one by one or in small groups to verify fixes
+4. If you fix code and tests pass — great, continue to next form
+5. If ALL hypotheses are wrong and you cannot make progress:
+   Output in your finish message: [REJECT] reason: <why all hypotheses are wrong>
+   [COUNTER_EVIDENCE] <code analysis or test output proving hypotheses wrong>
+
+## Rules
+- Do NOT modify any files in the tests/ directory
+- Do NOT change function/class signatures unless the design explicitly requires it
+- Address the Debug Forms systematically — don't ignore them
+- If you reject, provide CLEAR counter-evidence
+- Run `pytest <specific_test> -v` to verify each fix
+
+When done, call finish with a summary of fixes applied and test results.
+"""
+
+ANTICHEAT_BLACKBOX_PROMPT = """You are an anti-cheat test engineer. Generate variant tests to prevent hardcoded solutions.
+
+## Context
+Certain tests just flipped from FAILING to PASSING after code changes.
+This could mean the fix is legitimate, or the code might be "cheating" (e.g., hardcoding return values).
+Your job: write additional blackbox tests covering the SAME behavior with DIFFERENT inputs.
+
+## Your Workflow
+1. Read the list of flipped tests and their source code
+2. For each flipped test, understand what behavior it tests
+3. Write a variant test that tests the SAME API/function but with DIFFERENT input values
+4. The variant should verify the same contract but catch hardcoded solutions
+5. Write all variants to the specified output file
+6. Run the variant tests to verify they pass
+
+## Rules
+- ONLY create/edit files under the tests/ directory
+- Each variant must use DIFFERENT inputs from the original test
+- Variants must have real assertions — no pytest.skip()
+- If a variant fails, that's useful information — it means the fix may be a hack
+
+When done, call finish with a summary of variant tests created.
+"""
+
+
 # =============================================================================
 # Agent creation
 # =============================================================================
@@ -1037,6 +1195,70 @@ def create_code_agent_with_debug(llm: LLM) -> Agent:
     )
 
 
+# --- New flow agent factories (v2 — Debug Form architecture) ---
+
+def create_code_agent_smoke(llm: LLM, mode: str = "create") -> Agent:
+    """Create Code Agent in smoke-test-only mode — can write code, cannot run pytest."""
+    prompt = TDD_CODE_AGENT_SMOKE_MODIFY_PROMPT if mode == "modify" else TDD_CODE_AGENT_SMOKE_PROMPT
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "code_file_editor"},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": prompt},
+    )
+
+
+def create_test_agent_analyst(llm: LLM) -> Agent:
+    """Create Test Agent in analyst mode — fills Debug Forms, read-only."""
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "debug_form_tool"},
+            {"name": FileReadTool.name},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": TEST_AGENT_ANALYST_PROMPT},
+    )
+
+
+def create_code_agent_debug_fix(llm: LLM) -> Agent:
+    """Create Code Agent that receives Debug Forms and can run failing tests."""
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "code_file_editor"},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": TDD_CODE_AGENT_DEBUG_FIX_PROMPT},
+    )
+
+
+def create_anticheat_agent(llm: LLM) -> Agent:
+    """Create agent to write anti-cheat variant tests for flipped tests."""
+    return Agent(
+        llm=llm,
+        tools=[
+            {"name": "test_file_editor"},
+            {"name": "terminal"},
+            {"name": "glob"},
+            {"name": "grep"},
+        ],
+        include_default_tools=["FinishTool"],
+        system_prompt_kwargs={"custom_prompt": ANTICHEAT_BLACKBOX_PROMPT},
+    )
+
+
 # =============================================================================
 # Pytest output parser
 # =============================================================================
@@ -1074,6 +1296,97 @@ def parse_pytest_output(output: str) -> TestRunResult:
         errors=errors,
         output=output,
     )
+
+
+def _parse_per_test_results(output: str) -> list[PerTestResult]:
+    """Parse pytest -v output into per-test results.
+
+    Matches lines like:
+      tests/test_calc.py::test_add PASSED
+      tests/test_calc.py::test_div FAILED
+    Also extracts failure messages from FAILURES section.
+    """
+    results: list[PerTestResult] = []
+    seen: set[str] = set()
+
+    # Parse per-test status lines
+    for line in output.split("\n"):
+        line = line.strip()
+        # Match: path::test_name STATUS
+        m = re.match(r"([\w/\\._-]+::[\w_]+)\s+(PASSED|FAILED|ERROR|SKIPPED)", line)
+        if m:
+            test_id = m.group(1)
+            status = m.group(2).lower()
+            if test_id not in seen:
+                seen.add(test_id)
+                results.append(PerTestResult(test_id=test_id, status=status))
+
+    # Extract failure messages from FAILURES section
+    failure_blocks: dict[str, str] = {}
+    in_failures = False
+    current_test = ""
+    current_lines: list[str] = []
+    for line in output.split("\n"):
+        if line.strip().startswith("= FAILURES =") or line.strip().startswith("=== FAILURES ==="):
+            in_failures = True
+            continue
+        if in_failures and line.strip().startswith("= short test summary") or line.strip().startswith("==="):
+            if current_test and current_lines:
+                failure_blocks[current_test] = "\n".join(current_lines)
+            break
+        if in_failures:
+            # Match: ___ test_name ___
+            fm = re.match(r"_{3,}\s*([\w/\\._:-]+)\s*_{3,}", line)
+            if fm:
+                if current_test and current_lines:
+                    failure_blocks[current_test] = "\n".join(current_lines)
+                current_test = fm.group(1).strip()
+                current_lines = []
+            elif current_test:
+                current_lines.append(line)
+
+    # Attach failure messages to results
+    for r in results:
+        if r.status in ("failed", "error"):
+            # Try exact match, then partial match on test name
+            test_name = r.test_id.split("::")[-1] if "::" in r.test_id else r.test_id
+            msg = failure_blocks.get(r.test_id, "") or failure_blocks.get(test_name, "")
+            if msg:
+                r.failure_message = msg[:2000]
+
+    return results
+
+
+def run_tests_automated(
+    workspace: Path,
+    test_dirs: list[str] | None = None,
+    ignore_patterns: list[str] | None = None,
+    timeout: int = 300,
+) -> TestRunResult:
+    """Run all tests automatically via subprocess — no agent involved.
+
+    This is Phase 4: pure automation, no LLM.
+    """
+    if test_dirs is None:
+        test_dirs = ["tests/"]
+
+    cmd = ["python3", "-m", "pytest"] + test_dirs + ["-v", "--tb=long"]
+    for pat in (ignore_patterns or []):
+        cmd.extend(["--ignore", pat])
+
+    try:
+        result = subprocess.run(
+            cmd, cwd=workspace, capture_output=True, text=True, timeout=timeout,
+        )
+        combined = result.stdout + "\n" + result.stderr
+    except subprocess.TimeoutExpired:
+        combined = f"pytest timed out after {timeout}s"
+    except Exception as e:
+        combined = f"pytest execution error: {e}"
+
+    parsed = parse_pytest_output(combined)
+    parsed.per_test = _parse_per_test_results(combined)
+    return parsed
 
 
 def _extract_test_output_from_conversation(conversation: Conversation) -> str:
@@ -1325,248 +1638,216 @@ def run_tdd_pipeline(
     else:
         print("[TDD] No spec.md scenarios found, skipping black-box tests")
 
-    # ── Retry loop: Phase 3 → Phase 4 → Phase 4.5 → Phase 5 ──
-    retry_count = 0
+    # ── Retry loop: Phase 3 → Phase 4 → Phase 4.5/4.6/4.7 → Phase 5 ──
+    # v2 Debug Form architecture
     whitebox_passed = False
     blackbox_passed = False
     whitebox_output = ""
     blackbox_output = ""
-    debug_report: DebugReport | None = None
-    challenge: CodingChallenge | None = None
-    challenge_count = 0
     all_debug_reports: list[DebugReport] = []
     all_legacy_issues: list[LegacyIssue] = []
     all_attempts: list[str] = []
+    all_debug_form_sets: list[DebugFormSet] = []
     bb_test_file: Path | None = None
 
     # Initialize rollback manager
     rollback = RollbackManager(workspace)
     rollback.checkpoint("pipeline_start")
 
-    while retry_count < MAX_TOTAL_RETRIES:
-        # ── Phase 3: Code Implementation ──
-        print(f"[TDD] Phase 3: Code Implementation (attempt {retry_count + 1})")
-        pre_code_checkpoint = rollback.checkpoint("phase3_start")
+    # ── Phase 3: Code Implementation (smoke test only) ──
+    print("[TDD] Phase 3: Code Implementation (smoke test only)")
+    pre_code_checkpoint = rollback.checkpoint("phase3_start")
 
-        if debug_report:
-            # Use debug-aware code agent
-            code_agent = create_code_agent_with_debug(llm)
-            code_conv = Conversation(agent=code_agent, workspace=str(workspace))
-            modify_hint = ""
-            if mode == "modify":
-                modify_hint = (
-                    "\nThis is a MODIFY operation. Make targeted edits to existing files.\n"
-                    "Do NOT rewrite files from scratch. ALL tests must pass (existing + new).\n"
-                )
-            code_prompt = (
-                f"Implement the code to make all tests pass.\n\n"
-                f"Design documents: openspec/\n"
-                f"Stub files: {stub_list}\n"
-                f"Test files: {', '.join(test_files)}\n"
-                f"{modify_hint}\n"
-                f"{debug_report.to_prompt_text()}\n\n"
-                f"Run `pytest tests/ -v` to verify your implementation."
-            )
-        else:
-            code_agent = create_code_agent(llm, mode=mode)
-            code_conv = Conversation(agent=code_agent, workspace=str(workspace))
-            modify_hint = ""
-            if mode == "modify":
-                modify_hint = (
-                    "\nThis is a MODIFY operation. Make targeted edits to existing files.\n"
-                    "Do NOT rewrite files from scratch. ALL tests must pass (existing + new).\n"
-                )
-            code_prompt = (
-                f"Implement the code to make all tests pass.\n\n"
-                f"Design documents: openspec/\n"
-                f"Stub files: {stub_list}\n"
-                f"Test files: {', '.join(test_files)}\n"
-                f"{modify_hint}\n"
-                f"Run `pytest tests/ -v` to verify your implementation."
-            )
+    # Build smoke test command from stub modules
+    stub_modules = []
+    for sf in manifest.stub_files:
+        p = Path(sf)
+        # Convert path like "kvstore/stubs.py" to "kvstore.stubs"
+        parts = list(p.parts)
+        if parts[-1].endswith(".py"):
+            parts[-1] = parts[-1][:-3]
+        stub_modules.append(".".join(parts))
+    smoke_imports = "; ".join(f"import {m}" for m in stub_modules) if stub_modules else "print('no stubs')"
+    smoke_cmd = f"python3 -c '{smoke_imports}; print(\"smoke ok\")'"
 
-        code_conv.send_message(code_prompt)
-        code_conv.run()
-        if log_dir:
-            _save_agent_log(code_conv, log_dir, f"phase3_code_attempt{retry_count + 1}")
-
-        # Extract finish message to check for challenges
-        finish_msg = _extract_finish_message(code_conv)
-        all_attempts.append(f"Attempt {retry_count + 1}: {finish_msg[:200]}")
-
-        rollback.checkpoint("phase3_end")
-
-        # Check if Coding Agent challenged a hypothesis
-        if debug_report and finish_msg:
-            challenge = parse_challenge_from_finish(finish_msg)
-            if challenge:
-                print(f"  [CHALLENGE] Coding Agent challenges {challenge.hypothesis_id}: {challenge.challenge_reason}")
-                challenge_count += 1
-                if challenge_count <= MAX_CHALLENGE_RETRIES:
-                    # Rollback code changes
-                    rollback.rollback_to(pre_code_checkpoint)
-                    print(f"  Rolled back to pre-code checkpoint")
-                    # Re-run debug with challenge context
-                    debug_report = _run_debug_analysis(
-                        workspace, llm, whitebox_output, challenge, all_debug_reports
-                    )
-                    continue
-                else:
-                    print(f"  Challenge retries exhausted ({MAX_CHALLENGE_RETRIES})")
-
-        # ── Phase 3.5: Boundary violation detection ──
-        # If code agent tried to edit tests/, re-route to test fix agent
-        violations = _detect_boundary_violations(code_conv, "code")
-        if violations:
-            test_paths = [v.target_path for v in violations]
-            print(f"  [BOUNDARY] Code agent attempted to edit test file(s): {test_paths}")
-            print("[TDD] Phase 3.5: Test Fix (re-routing to test agent)")
-
-            test_fix_agent = create_test_agent_fix(llm)
-            test_fix_conv = Conversation(agent=test_fix_agent, workspace=str(workspace))
-
-            violation_context = "\n".join(
-                f"- Tried to edit: {v.target_path}" for v in violations
-            )
-            fix_prompt = (
-                f"Fix test issues identified by debug analysis.\n\n"
-                f"## Debug Report\n"
-                f"{debug_report.to_prompt_text() if debug_report else 'No debug report available.'}\n\n"
-                f"## What the coding agent wanted to change\n{violation_context}\n\n"
-                f"## Coding agent's reasoning\n{finish_msg[:2000]}\n\n"
-                f"Design documents: openspec/\n"
-                f"Run `pytest tests/ -v` to verify after fixing."
-            )
-            test_fix_conv.send_message(fix_prompt)
-            test_fix_conv.run()
-            if log_dir:
-                _save_agent_log(test_fix_conv, log_dir, f"phase3_5_testfix_attempt{retry_count + 1}")
-
-        # ── Phase 4: White-box Verification ──
-        print("[TDD] Phase 4: White-box Verification")
-        wb_agent = create_test_agent_verify(llm)
-        wb_conv = Conversation(agent=wb_agent, workspace=str(workspace))
-        wb_conv.send_message(
-            "Run all white-box tests and report results.\n\n"
-            "Execute: `pytest tests/ -v --tb=long --ignore=tests/test_blackbox_auto.py "
-            "--ignore=tests/test_whitebox_from_bb.py --ignore=tests/test_blackbox_variants.py`\n\n"
-            "Report the full output and whether all tests passed."
+    code_agent = create_code_agent_smoke(llm, mode=mode)
+    code_conv = Conversation(agent=code_agent, workspace=str(workspace))
+    modify_hint = ""
+    if mode == "modify":
+        modify_hint = (
+            "\nThis is a MODIFY operation. Make targeted edits to existing files.\n"
+            "Do NOT rewrite files from scratch.\n"
         )
-        wb_conv.run()
-        if log_dir:
-            _save_agent_log(wb_conv, log_dir, f"phase4_verify_attempt{retry_count + 1}")
+    code_conv.send_message(
+        f"Implement the code to satisfy the design.\n\n"
+        f"Design documents: openspec/\n"
+        f"Stub files: {stub_list}\n"
+        f"Test files (read-only, for reference): {', '.join(test_files)}\n"
+        f"{modify_hint}\n"
+        f"After implementing, run this smoke test:\n  {smoke_cmd}\n"
+        f"Do NOT run pytest."
+    )
+    code_conv.run()
+    if log_dir:
+        _save_agent_log(code_conv, log_dir, "phase3_code_smoke")
 
-        whitebox_output = _extract_test_output_from_conversation(wb_conv)
-        wb_result = parse_pytest_output(whitebox_output)
-        print(f"  White-box: {wb_result.passed} passed, {wb_result.failed} failed, {wb_result.errors} errors")
+    finish_msg = _extract_finish_message(code_conv)
+    all_attempts.append(f"Phase 3 smoke: {finish_msg[:200]}")
+    rollback.checkpoint("phase3_end")
 
-        if not wb_result.all_passed:
-            retry_count += 1
-            if retry_count >= MAX_WHITEBOX_RETRIES:
-                print(f"  White-box retries exhausted ({MAX_WHITEBOX_RETRIES})")
-                # Mark remaining failures as legacy issues
-                _mark_legacy_issues(
-                    whitebox_output, all_debug_reports, all_attempts, all_legacy_issues
-                )
+    # ── Phase 4: Auto Test Run (no agent) ──
+    print("[TDD] Phase 4: Auto Test Run (all whitebox + blackbox)")
+    ignore_pats = [
+        "tests/test_blackbox_auto.py",
+        "tests/test_whitebox_from_bb.py",
+        "tests/test_blackbox_variants.py",
+    ]
+    # Also ignore any anticheat files from previous runs
+    for ac in workspace.glob("tests/test_anticheat_*.py"):
+        ignore_pats.append(str(ac.relative_to(workspace)))
+
+    wb_results = run_tests_automated(workspace, ["tests/"], ignore_pats)
+    whitebox_output = wb_results.output
+    print(f"  White-box: {wb_results.passed} passed, {wb_results.failed} failed, {wb_results.errors} errors")
+
+    if wb_results.all_passed:
+        whitebox_passed = True
+    else:
+        # ── Debug Form loop ──
+        debug_retry = 0
+        baseline_results = wb_results
+        previous_rejection: Rejection | None = None
+
+        while debug_retry < MAX_DEBUG_FORM_RETRIES:
+            # Phase 4.5: Test Agent fills Debug Forms
+            form_set = _run_debug_form_analysis(
+                workspace, llm, baseline_results, previous_rejection, log_dir,
+                round_num=debug_retry + 1,
+            )
+            all_debug_form_sets.append(form_set)
+
+            if not form_set.forms:
+                print("  No forms filled — cannot proceed with debug")
                 break
 
-            # ── Phase 4.5: Debug Analysis ──
-            debug_report = _run_debug_analysis(
-                workspace, llm, whitebox_output, challenge=None,
-                all_debug_reports=all_debug_reports,
-            )
-            challenge = None
-            challenge_count = 0
-            continue
-
-        whitebox_passed = True
-        # ── Phase 5: Black-box Tests ──
-        if has_spec_scenarios:
-            # Phase 5a: Generate real blackbox tests using an agent
-            print("[TDD] Phase 5a: Black-box Test Generation (agent writes from spec.md)")
-            bb_write_agent = create_blackbox_test_agent(llm, mode=mode)
-            bb_write_conv = Conversation(agent=bb_write_agent, workspace=str(workspace))
-            modify_hint = ""
-            if mode == "modify":
-                modify_hint = (
-                    "\nThis is a MODIFY operation. Only write tests for NEW and CHANGED scenarios.\n"
-                    "Preserve existing blackbox tests.\n"
+            # Phase 4.6: Code Agent fixes with forms (with rejection loop)
+            rejection_count = 0
+            made_changes = False
+            while rejection_count < MAX_REJECTION_RETRIES:
+                pre_fix_checkpoint = rollback.checkpoint(f"phase4_6_round{debug_retry + 1}")
+                made_changes, rejection = _run_debug_fix(
+                    workspace, llm, form_set, baseline_results, mode, log_dir,
+                    round_num=debug_retry + 1,
                 )
-            bb_write_conv.send_message(
-                "Write executable black-box tests from the spec.md scenarios.\n\n"
-                "Read openspec/spec.md for the Given/When/Then scenarios.\n"
-                "Read the implementation code to understand how to import modules.\n\n"
-                "Create tests/test_blackbox_auto.py with one test per scenario.\n"
-                "Each test must have REAL assertions — no pytest.skip().\n"
-                f"{modify_hint}"
-                "Run `pytest tests/test_blackbox_auto.py -v` to verify they pass."
+                if rejection:
+                    rejection_count += 1
+                    previous_rejection = rejection
+                    if rejection_count < MAX_REJECTION_RETRIES:
+                        print(f"  Rejection {rejection_count}/{MAX_REJECTION_RETRIES} — re-analyzing")
+                        rollback.rollback_to(pre_fix_checkpoint)
+                        # Re-run Phase 4.5 with rejection context
+                        form_set = _run_debug_form_analysis(
+                            workspace, llm, baseline_results, previous_rejection, log_dir,
+                            round_num=debug_retry + 1,
+                        )
+                        all_debug_form_sets.append(form_set)
+                    else:
+                        print(f"  Rejection retries exhausted ({MAX_REJECTION_RETRIES})")
+                else:
+                    previous_rejection = None
+                    break
+
+            # Phase 4.7: Anti-cheat for flipped tests
+            after_results = run_tests_automated(workspace, ["tests/"], ignore_pats)
+            anticheat_files = _run_anticheat(
+                workspace, llm, baseline_results, after_results,
+                round_num=debug_retry + 1, log_dir=log_dir,
             )
-            bb_write_conv.run()
-            if log_dir:
-                _save_agent_log(bb_write_conv, log_dir, "phase5a_bb_write")
 
-            # Check if blackbox test agent tried to edit business code
-            bb_violations = _detect_boundary_violations(bb_write_conv, "test")
-            if bb_violations:
-                code_paths = [v.target_path for v in bb_violations]
-                print(f"  [BOUNDARY] Blackbox test agent attempted to edit code file(s): {code_paths}")
+            # Re-run all tests (including anticheat)
+            all_ignore = [p for p in ignore_pats if "anticheat" not in p]
+            final_results = run_tests_automated(workspace, ["tests/"], all_ignore)
+            whitebox_output = final_results.output
+            print(f"  After round {debug_retry + 1}: {final_results.passed} passed, {final_results.failed} failed")
 
-            bb_test_file = workspace / "tests" / "test_blackbox_auto.py"
+            if final_results.all_passed:
+                whitebox_passed = True
+                break
 
-            # Phase 5b: Verify blackbox tests
-            if bb_test_file.exists():
-                print("[TDD] Phase 5b: Black-box Verification")
-                bb_verify_agent = create_test_agent_verify(llm)
-                bb_verify_conv = Conversation(agent=bb_verify_agent, workspace=str(workspace))
-                bb_verify_conv.send_message(
-                    "Run the black-box tests and report results.\n\n"
-                    "Execute: `pytest tests/test_blackbox_auto.py -v --tb=long`\n\n"
-                    "Report the full output and whether all tests passed."
-                )
-                bb_verify_conv.run()
-                if log_dir:
-                    _save_agent_log(bb_verify_conv, log_dir, "phase5b_bb_verify")
+            # Prepare for next round
+            baseline_results = final_results
+            debug_retry += 1
+            all_attempts.append(f"Debug round {debug_retry}: {final_results.failed} still failing")
 
-                blackbox_output = _extract_test_output_from_conversation(bb_verify_conv)
-                bb_result = parse_pytest_output(blackbox_output)
-                print(f"  Black-box: {bb_result.passed} passed, {bb_result.failed} failed, {bb_result.errors} errors")
+        if not whitebox_passed:
+            print(f"  Debug form retries exhausted ({MAX_DEBUG_FORM_RETRIES})")
+            _mark_legacy_issues(
+                whitebox_output, all_debug_reports, all_attempts, all_legacy_issues
+            )
 
-                if not bb_result.all_passed and bb_result.failed > 0:
-                    # ── BB/WB Combination: expose + anti-cheat ──
-                    failing_bb_tests = _extract_failing_test_names(blackbox_output)
-                    if failing_bb_tests:
-                        print(f"  Exposing {len(failing_bb_tests)} BB tests as WB + generating variants")
-                        wb_from_bb = workspace / "tests" / "test_whitebox_from_bb.py"
-                        expose_as_whitebox(failing_bb_tests, bb_test_file, wb_from_bb)
+    # ── Phase 5: Black-box Tests ──
+    if whitebox_passed and has_spec_scenarios:
+        print("[TDD] Phase 5a: Black-box Test Generation (agent writes from spec.md)")
+        bb_write_agent = create_blackbox_test_agent(llm, mode=mode)
+        bb_write_conv = Conversation(agent=bb_write_agent, workspace=str(workspace))
+        modify_hint = ""
+        if mode == "modify":
+            modify_hint = (
+                "\nThis is a MODIFY operation. Only write tests for NEW and CHANGED scenarios.\n"
+                "Preserve existing blackbox tests.\n"
+            )
+        bb_write_conv.send_message(
+            "Write executable black-box tests from the spec.md scenarios.\n\n"
+            "Read openspec/spec.md for the Given/When/Then scenarios.\n"
+            "Read the implementation code to understand how to import modules.\n\n"
+            "Create tests/test_blackbox_auto.py with one test per scenario.\n"
+            "Each test must have REAL assertions — no pytest.skip().\n"
+            f"{modify_hint}"
+            "Run `pytest tests/test_blackbox_auto.py -v` to verify they pass."
+        )
+        bb_write_conv.run()
+        if log_dir:
+            _save_agent_log(bb_write_conv, log_dir, "phase5a_bb_write")
 
-                        # Generate anti-cheat variants
-                        scenarios = _parse_spec_scenarios(
-                            spec_path.read_text(encoding="utf-8")
-                        )
-                        variant_file = workspace / "tests" / "test_blackbox_variants.py"
-                        generate_variant_tests_for_failures(
-                            failing_bb_tests, bb_test_file, scenarios, llm, variant_file
-                        )
+        bb_violations = _detect_boundary_violations(bb_write_conv, "test")
+        if bb_violations:
+            code_paths = [v.target_path for v in bb_violations]
+            print(f"  [BOUNDARY] Blackbox test agent attempted to edit code file(s): {code_paths}")
 
-                    # Run debug analysis for BB failures
-                    retry_count += 1
-                    if retry_count >= MAX_TOTAL_RETRIES:
-                        print(f"  Total retries exhausted ({MAX_TOTAL_RETRIES})")
-                        _mark_legacy_issues(
-                            blackbox_output, all_debug_reports, all_attempts, all_legacy_issues
-                        )
-                        break
+        bb_test_file = workspace / "tests" / "test_blackbox_auto.py"
 
-                    debug_report = _run_debug_analysis(
-                        workspace, llm, blackbox_output, challenge=None,
-                        all_debug_reports=all_debug_reports,
+        if bb_test_file.exists():
+            print("[TDD] Phase 5b: Black-box Verification (auto)")
+            bb_results = run_tests_automated(
+                workspace, ["tests/test_blackbox_auto.py"],
+            )
+            blackbox_output = bb_results.output
+            print(f"  Black-box: {bb_results.passed} passed, {bb_results.failed} failed, {bb_results.errors} errors")
+
+            if bb_results.all_passed:
+                blackbox_passed = True
+            elif bb_results.failed > 0:
+                # Expose failing BB tests as WB + generate variants
+                failing_bb_tests = _extract_failing_test_names(blackbox_output)
+                if failing_bb_tests:
+                    print(f"  Exposing {len(failing_bb_tests)} BB tests as WB + generating variants")
+                    wb_from_bb = workspace / "tests" / "test_whitebox_from_bb.py"
+                    expose_as_whitebox(failing_bb_tests, bb_test_file, wb_from_bb)
+
+                    scenarios = _parse_spec_scenarios(
+                        spec_path.read_text(encoding="utf-8")
                     )
-                    challenge = None
-                    challenge_count = 0
-                    continue
-
-        blackbox_passed = True
-        break
+                    variant_file = workspace / "tests" / "test_blackbox_variants.py"
+                    generate_variant_tests_for_failures(
+                        failing_bb_tests, bb_test_file, scenarios, llm, variant_file
+                    )
+                _mark_legacy_issues(
+                    blackbox_output, all_debug_reports, all_attempts, all_legacy_issues
+                )
+        else:
+            blackbox_passed = True  # no BB test file = skip
+    elif whitebox_passed:
+        blackbox_passed = True  # no spec scenarios = skip
 
     # ── Collect results ──
     files_created = []
@@ -1582,12 +1863,12 @@ def run_tdd_pipeline(
 
     success = whitebox_passed and blackbox_passed
     legacy_count = len(all_legacy_issues)
+    debug_form_count = sum(len(fs.forms) for fs in all_debug_form_sets)
     summary_parts = [
         f"TDD pipeline {'PASSED' if success else 'FAILED'}",
         f"White-box: {'PASSED' if whitebox_passed else 'FAILED'}",
         f"Black-box: {'PASSED' if blackbox_passed else 'SKIPPED' if not has_spec_scenarios else 'FAILED'}",
-        f"Retries: {retry_count}",
-        f"Debug reports: {len(all_debug_reports)}",
+        f"Debug forms: {debug_form_count}",
     ]
     if legacy_count:
         summary_parts.append(f"Legacy issues: {legacy_count}")
@@ -1602,7 +1883,7 @@ def run_tdd_pipeline(
         whitebox_output=whitebox_output,
         blackbox_output=blackbox_output,
         summary=" | ".join(summary_parts),
-        retry_count=retry_count,
+        retry_count=len(all_debug_form_sets),
         legacy_issues=all_legacy_issues,
         debug_reports=all_debug_reports,
     )
@@ -1690,6 +1971,187 @@ def _run_debug_analysis(
     all_debug_reports.append(report)
     print(f"  Hypotheses: {len(active)} active, {len(excluded)} excluded")
     return report
+
+
+# =============================================================================
+# v2 Debug Form helpers (Phase 4.5 / 4.6 / 4.7)
+# =============================================================================
+
+def _run_debug_form_analysis(
+    workspace: Path,
+    llm: LLM,
+    test_results: TestRunResult,
+    previous_rejection: Rejection | None,
+    log_dir: Path | None,
+    round_num: int = 1,
+) -> DebugFormSet:
+    """Phase 4.5: Test Agent fills Debug Forms for each failing test."""
+    print(f"[TDD] Phase 4.5: Debug Form Analysis (round {round_num})")
+
+    # Reset form executor for this round
+    reset_debug_form_executor(workspace)
+
+    # Build failure summary for the analyst
+    failing = [r for r in test_results.per_test if r.status in ("failed", "error")]
+    failure_text = f"## Test Results: {test_results.passed} passed, {test_results.failed} failed, {test_results.errors} errors\n\n"
+    failure_text += "### Failing Tests\n"
+    for r in failing:
+        failure_text += f"\n**{r.test_id}** [{r.status}]\n"
+        if r.failure_message:
+            failure_text += f"```\n{r.failure_message[:1000]}\n```\n"
+
+    # Add rejection context if this is a re-analysis
+    rejection_context = ""
+    if previous_rejection:
+        rejection_context = (
+            f"\n## REJECTION from Coding Agent\n"
+            f"Your previous hypotheses were rejected.\n"
+            f"Counter-evidence: {previous_rejection.counter_evidence}\n"
+            f"Code analysis: {previous_rejection.code_analysis}\n\n"
+            f"Re-analyze from a DIFFERENT angle. Do NOT repeat the same guesses.\n"
+        )
+
+    analyst_agent = create_test_agent_analyst(llm)
+    analyst_conv = Conversation(agent=analyst_agent, workspace=str(workspace))
+    analyst_conv.send_message(
+        f"Analyze these test failures and fill Debug Forms.\n\n"
+        f"{failure_text}\n"
+        f"## Full Test Output\n```\n{test_results.output[:4000]}\n```\n"
+        f"{rejection_context}\n"
+        f"Read the implementation code and test source to understand each failure.\n"
+        f"Use debug_form_tool to fill a form for each failing test (guessed_cause is REQUIRED).\n"
+        f"Use batch_fill if many tests fail for the same root cause.\n"
+        f"Call submit when done."
+    )
+    analyst_conv.run()
+    if log_dir:
+        _save_agent_log(analyst_conv, log_dir, f"phase4_5_analyst_round{round_num}")
+
+    # Collect forms from executor
+    executor = get_debug_form_executor(workspace)
+    form_set = executor.form_set
+    flagged = sum(1 for f in form_set.forms if f.flagged_as_test_bug)
+    print(f"  Forms: {len(form_set.forms)} filled, {flagged} flagged as test bugs")
+    return form_set
+
+
+def _run_debug_fix(
+    workspace: Path,
+    llm: LLM,
+    debug_forms: DebugFormSet,
+    test_results: TestRunResult,
+    mode: str,
+    log_dir: Path | None,
+    round_num: int = 1,
+) -> tuple[bool, Rejection | None]:
+    """Phase 4.6: Coding Agent receives Debug Forms, fixes code or rejects.
+
+    Returns (made_changes: bool, rejection: Rejection | None).
+    """
+    print(f"[TDD] Phase 4.6: Debug Fix (round {round_num})")
+
+    fix_agent = create_code_agent_debug_fix(llm)
+    fix_conv = Conversation(agent=fix_agent, workspace=str(workspace))
+
+    modify_hint = ""
+    if mode == "modify":
+        modify_hint = (
+            "\nThis is a MODIFY operation. Make targeted edits to existing files.\n"
+            "Do NOT rewrite files from scratch.\n"
+        )
+
+    fix_conv.send_message(
+        f"Fix code based on these Debug Forms from the test analyst.\n\n"
+        f"{debug_forms.to_prompt_text()}\n\n"
+        f"## Test Summary\n"
+        f"{test_results.passed} passed, {test_results.failed} failed, {test_results.errors} errors\n"
+        f"{modify_hint}\n"
+        f"Design documents: openspec/\n"
+        f"Run failing tests individually with `pytest <test_id> -v` to verify fixes.\n"
+        f"If ALL hypotheses are wrong, output [REJECT] reason: ... with [COUNTER_EVIDENCE] ..."
+    )
+    fix_conv.run()
+    if log_dir:
+        _save_agent_log(fix_conv, log_dir, f"phase4_6_fix_round{round_num}")
+
+    # Check for rejection
+    finish_msg = _extract_finish_message(fix_conv)
+    rejection = parse_rejection_from_finish(finish_msg)
+    if rejection:
+        print(f"  [REJECT] {rejection.counter_evidence[:100]}")
+        return False, rejection
+
+    # Check for boundary violations (code agent tried to edit tests)
+    violations = _detect_boundary_violations(fix_conv, "code")
+    if violations:
+        test_paths = [v.target_path for v in violations]
+        print(f"  [BOUNDARY] Code agent attempted to edit test file(s): {test_paths}")
+
+    print(f"  Fix applied (finish: {finish_msg[:100]}...)")
+    return True, None
+
+
+def _run_anticheat(
+    workspace: Path,
+    llm: LLM,
+    before_results: TestRunResult,
+    after_results: TestRunResult,
+    round_num: int,
+    log_dir: Path | None,
+) -> list[str]:
+    """Phase 4.7: Generate anti-cheat blackbox tests for flipped tests.
+
+    Returns list of new test file paths.
+    """
+    flipped = _identify_flipped_tests(before_results, after_results)
+    if not flipped:
+        print("[TDD] Phase 4.7: No flipped tests — skipping anti-cheat")
+        return []
+
+    print(f"[TDD] Phase 4.7: Anti-cheat for {len(flipped)} flipped tests")
+
+    # Build context about flipped tests
+    flipped_info = "## Flipped Tests (were FAILING, now PASSING)\n\n"
+    for test_id in flipped:
+        flipped_info += f"- {test_id}\n"
+
+    output_file = f"tests/test_anticheat_round{round_num}.py"
+
+    anticheat_agent = create_anticheat_agent(llm)
+    anticheat_conv = Conversation(agent=anticheat_agent, workspace=str(workspace))
+    anticheat_conv.send_message(
+        f"Generate anti-cheat variant tests for these flipped tests.\n\n"
+        f"{flipped_info}\n"
+        f"Read the source code of each flipped test to understand what it tests.\n"
+        f"Write variant tests with DIFFERENT inputs to {output_file}.\n"
+        f"Run `pytest {output_file} -v` to verify they pass."
+    )
+    anticheat_conv.run()
+    if log_dir:
+        _save_agent_log(anticheat_conv, log_dir, f"phase4_7_anticheat_round{round_num}")
+
+    new_files = []
+    ac_path = workspace / output_file
+    if ac_path.exists():
+        new_files.append(output_file)
+        print(f"  Created {output_file}")
+    else:
+        print(f"  Warning: {output_file} not created")
+
+    return new_files
+
+
+def _identify_flipped_tests(
+    before: TestRunResult, after: TestRunResult,
+) -> list[str]:
+    """Find tests that went from failing/error to passing."""
+    before_failing = {
+        r.test_id for r in before.per_test if r.status in ("failed", "error")
+    }
+    after_passing = {
+        r.test_id for r in after.per_test if r.status == "passed"
+    }
+    return sorted(before_failing & after_passing)
 
 
 def _extract_finish_message(conversation: Conversation) -> str:

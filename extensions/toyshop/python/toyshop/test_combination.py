@@ -252,3 +252,120 @@ def generate_variant_tests_for_failures(
     variant_file.write_text(content, encoding="utf-8")
 
     return variants
+
+
+# =============================================================================
+# Anti-cheat for flipped tests (v2 Debug Form flow)
+# =============================================================================
+
+FLIPPED_VARIANT_PROMPT = """You are generating an anti-cheat variant test.
+
+A test that was previously FAILING is now PASSING after code changes.
+Generate a variant test with DIFFERENT inputs to verify the fix is genuine (not hardcoded).
+
+Original test:
+```python
+{original_test}
+```
+
+Generate ONE variant test function that:
+1. Calls the EXACT same API/function as the original test
+2. Uses COMPLETELY DIFFERENT input values
+3. Has the CORRECT expected result for the new inputs
+4. Function name: {variant_name}
+
+Return ONLY the Python function code, no explanation.
+"""
+
+
+def generate_anticheat_tests_for_flipped(
+    flipped_test_ids: list[str],
+    test_dir: Path,
+    llm: "LLM",
+    output_file: Path,
+) -> list[str]:
+    """Generate anti-cheat variant tests for tests that flipped from failing to passing.
+
+    Args:
+        flipped_test_ids: Test IDs like "tests/test_calc.py::test_add"
+        test_dir: Path to tests/ directory
+        llm: LLM instance
+        output_file: Where to write variant tests
+
+    Returns:
+        List of variant test names created.
+    """
+    # Group by file
+    file_tests: dict[str, list[str]] = {}
+    for tid in flipped_test_ids:
+        if "::" in tid:
+            fpath, tname = tid.split("::", 1)
+            file_tests.setdefault(fpath, []).append(tname)
+
+    all_import_lines: list[str] = []
+    variant_codes: list[str] = []
+    variant_names: list[str] = []
+
+    for fpath, test_names in file_tests.items():
+        full_path = test_dir.parent / fpath  # test_dir is workspace/tests, fpath is tests/xxx.py
+        if not full_path.exists():
+            continue
+
+        source = full_path.read_text(encoding="utf-8")
+        lines = source.split("\n")
+
+        # Collect imports
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                if line not in all_import_lines:
+                    all_import_lines.append(line)
+            elif stripped and not stripped.startswith("#") and not stripped.startswith('"""'):
+                break
+
+        # Parse to find function bodies
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in test_names:
+                    start = node.lineno - 1
+                    end = node.end_lineno or start + 1
+                    test_source = "\n".join(lines[start:end])
+                    variant_name = f"{node.name}_anticheat"
+
+                    prompt = FLIPPED_VARIANT_PROMPT.format(
+                        original_test=test_source,
+                        variant_name=variant_name,
+                    )
+                    try:
+                        response = llm.completion(
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        content = response.choices[0].message.content or ""
+                        # Extract code
+                        code_match = re.search(r"```python\n(.*?)```", content, re.DOTALL)
+                        if code_match:
+                            code = code_match.group(1).strip()
+                        else:
+                            func_match = re.search(r"(def \w+\(.*?\n(?:[ \t]+.+\n)*)", content)
+                            code = func_match.group(1).strip() if func_match else content.strip()
+
+                        if code:
+                            variant_codes.append(code)
+                            variant_names.append(variant_name)
+                    except Exception:
+                        pass  # skip on LLM error
+
+    if not variant_codes:
+        return []
+
+    header = '"""Anti-cheat variant tests for flipped tests."""\n\n'
+    imports = "\n".join(all_import_lines) + "\n\n" if all_import_lines else ""
+    file_content = header + imports + "\n\n".join(variant_codes) + "\n"
+    output_file.write_text(file_content, encoding="utf-8")
+
+    return variant_names
