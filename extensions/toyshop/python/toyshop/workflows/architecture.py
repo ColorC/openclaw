@@ -313,10 +313,11 @@ def design_modules_node(llm: LLM, state: ArchitectureState) -> dict[str, Any]:
     if not state.proposal or not state.analysis:
         return {"error": "Missing proposal or analysis", "current_step": "analyze"}
 
-    system = """你是一位软件架构师。根据需求分析设计模块结构：
+    system = """你是一位软件架构师。根据需求分析设计 Python 模块结构：
 - 每个模块应有单一职责
 - 模块间依赖应最小化
 - 考虑可测试性和可维护性
+- 文件路径使用 Python 包格式（如 mdtable/parser.py）
 
 请使用 design_modules 工具返回模块设计。"""
 
@@ -384,9 +385,14 @@ def design_interfaces_node(llm: LLM, state: ArchitectureState) -> dict[str, Any]
         return {"error": "No modules to design interfaces for", "current_step": "modules"}
 
     system = """你是一位软件架构师。为已设计的模块定义接口：
-- 每个接口应有清晰的签名
+- 每个接口应有清晰的 Python 签名（def/class 语法）
 - 接口应体现模块的核心功能
 - 考虑类型安全
+- 签名必须是合法的 Python 代码，例如：
+  - `def parse(text: str) -> Table`
+  - `class QueryBuilder`
+  - `def __init__(self, table: Table) -> None`
+- 不要使用 TypeScript/JavaScript 语法
 
 请使用 design_interfaces 工具返回接口设计。"""
 

@@ -516,8 +516,31 @@ def _normalize_signature(name: str, sig: str) -> str:
     return f"def {name}({sig})"
 
 
+def _is_python_signature(sig: str) -> bool:
+    """Check if a signature looks like valid Python (not TypeScript/JS)."""
+    ts_markers = [
+        "extends ", " => ", "readonly ", "keyof ", "Partial<",
+        "interface ", "type ", ": string", ": number", ": boolean",
+        ": any", "?: ", "string[]", "number[]", "boolean[]",
+        "<T", "Record<", "Promise<",
+    ]
+    sig_lower = sig.lower()
+    for marker in ts_markers:
+        if marker.lower() in sig_lower:
+            return False
+    # Must start with def/class/@dataclass or be a bare signature like (a: int) -> int
+    stripped = sig.strip()
+    if stripped.startswith(("def ", "class ", "@", "(")):
+        return True
+    # Likely not Python
+    return False
+
+
 def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
     """Generate Python stub code from parsed interfaces."""
+    # Filter out non-Python signatures
+    py_interfaces = [i for i in interfaces if _is_python_signature(i["signature"])]
+
     lines: list[str] = [
         '"""Auto-generated stubs from design.md signatures."""',
         "",
@@ -531,7 +554,7 @@ def _generate_stub_code(interfaces: list[dict[str, str]]) -> str:
     classes: dict[str, list[dict[str, str]]] = {}
     functions: list[dict[str, str]] = []
 
-    for iface in interfaces:
+    for iface in py_interfaces:
         sig = _normalize_signature(iface["name"], iface["signature"])
         iface = {**iface, "signature": sig}
         if sig.startswith("class "):
