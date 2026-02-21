@@ -3,10 +3,10 @@
 Workflow:
   1. create_batch()        — create batch folder, save requirements.md
   2. run_spec_generation()  — requirement + architecture workflows → openspec docs
-  3. prepare_tasks()        — parse tasks.md → create task folders
-  4. run_task()             — copy openspec, run TDD pipeline, save logs
+  3. prepare_tasks()        — parse tasks.md → create task folders (display only)
+  4. run_batch_tdd()        — run single TDD pipeline for entire batch
   5. run_batch()            — orchestrate 1-4 serially
-  6. resume_batch()         — resume from last incomplete task
+  6. resume_batch()         — resume if TDD not yet completed
 """
 
 from __future__ import annotations
@@ -137,6 +137,9 @@ def parse_tasks_md(text: str) -> list[dict[str, Any]]:
         # Format B: - ⬜ **X.Y** Title
         m_sub_bullet = re.match(r"^-\s+⬜\s+\*\*([\d.]+)\*\*\s+(.+)", line)
 
+        # Format C: simple numbered list "1. Title"
+        m_simple = re.match(r"^(\d+)\.\s+(.+)", line) if not m_top and not m_sub_h3 and not m_sub_bullet else None
+
         if m_top:
             task_id = m_top.group(1)
             title = m_top.group(2).strip()
@@ -197,6 +200,17 @@ def parse_tasks_md(text: str) -> list[dict[str, Any]]:
                 "dependencies": deps,
                 "assigned_module": module,
             })
+        elif m_simple:
+            task_id = m_simple.group(1)
+            title = m_simple.group(2).strip()
+            tasks.append({
+                "id": task_id,
+                "title": title,
+                "description": "",
+                "dependencies": [],
+                "assigned_module": None,
+            })
+            i += 1
         else:
             i += 1
 
@@ -320,39 +334,24 @@ def prepare_tasks(batch: BatchState) -> list[TaskState]:
     return task_states
 
 
-def run_task(batch: BatchState, task: TaskState, llm: LLM) -> TaskState:
-    """Run TDD pipeline for a single task."""
-    if task.task_dir is None:
-        task.status = "failed"
-        return task
-
-    # Check dependencies
-    completed_ids = {t.id for t in batch.tasks if t.status == "completed"}
-    for dep in task.dependencies:
-        if dep not in completed_ids:
-            print(f"  [SKIP] Task {task.id} — dependency {dep} not completed")
-            task.status = "skipped"
-            _save_task_json(task)
-            return task
-
-    print(f"[PM] Running task {task.id}: {task.title}")
-    task.status = "in_progress"
-    _save_task_json(task)
+def run_batch_tdd(batch: BatchState, llm: LLM) -> TDDResult:
+    """Run a single TDD pipeline for the entire batch."""
+    print("[PM] Running TDD pipeline for batch")
+    batch.status = "in_progress"
     _save_progress(batch)
 
-    # Prepare workspace
-    workspace = task.task_dir / "workspace"
+    # Workspace at batch level
+    workspace = batch.batch_dir / "workspace"
     workspace.mkdir(exist_ok=True)
     ws_openspec = workspace / "openspec"
     if ws_openspec.exists():
         shutil.rmtree(ws_openspec)
     shutil.copytree(batch.batch_dir / "openspec", ws_openspec)
 
-    # Agent logs directory
-    log_dir = task.task_dir / "agent_logs"
+    # Agent logs at batch level
+    log_dir = batch.batch_dir / "agent_logs"
     log_dir.mkdir(exist_ok=True)
 
-    # Run TDD pipeline
     try:
         result = run_tdd_pipeline(
             workspace=workspace,
@@ -360,15 +359,14 @@ def run_task(batch: BatchState, task: TaskState, llm: LLM) -> TaskState:
             log_dir=log_dir,
         )
     except Exception as e:
-        task.status = "failed"
-        _save_task_json(task)
-        _write_json(task.task_dir / "result.json", {"error": str(e)})
-        return task
+        batch.status = "failed"
+        batch.error = f"TDD pipeline error: {e}"
+        _save_progress(batch)
+        _write_json(batch.batch_dir / "result.json", {"error": str(e)})
+        return TDDResult(success=False, summary=str(e))
 
     # Save result
-    task.status = "completed" if result.success else "failed"
-    _save_task_json(task)
-    _write_json(task.task_dir / "result.json", {
+    _write_json(batch.batch_dir / "result.json", {
         "success": result.success,
         "whitebox_passed": result.whitebox_passed,
         "blackbox_passed": result.blackbox_passed,
@@ -377,11 +375,15 @@ def run_task(batch: BatchState, task: TaskState, llm: LLM) -> TaskState:
         "files_created": result.files_created,
         "test_files": result.test_files,
     })
+
+    batch.status = "completed" if result.success else "failed"
+    if not result.success:
+        batch.error = result.summary
     _save_progress(batch)
 
     status_icon = "✓" if result.success else "✗"
-    print(f"  [{status_icon}] Task {task.id} — {task.status}")
-    return task
+    print(f"  [{status_icon}] Batch TDD — {batch.status}")
+    return result
 
 
 def run_batch(
@@ -390,7 +392,7 @@ def run_batch(
     user_input: str,
     llm: LLM | None = None,
 ) -> BatchState:
-    """End-to-end: create batch → generate specs → parse tasks → run each task."""
+    """End-to-end: create batch → generate specs → parse tasks → run TDD pipeline."""
     if llm is None:
         llm = create_llm()
 
@@ -402,28 +404,15 @@ def run_batch(
     if batch.status == "failed":
         return batch
 
-    # Step 3: Parse tasks
-    tasks = prepare_tasks(batch)
-    if not tasks:
-        batch.status = "failed"
-        batch.error = "No tasks parsed from tasks.md"
-        _save_progress(batch)
-        return batch
+    # Step 3: Parse tasks (for display/tracking only)
+    prepare_tasks(batch)
 
-    # Step 4: Run tasks serially
-    for task in tasks:
-        if task.status in ("completed", "skipped"):
-            continue
-        run_task(batch, task, llm)
-
-    # Final status
-    all_done = all(t.status in ("completed", "skipped") for t in batch.tasks)
-    batch.status = "completed" if all_done else "failed"
-    _save_progress(batch)
+    # Step 4: Run single TDD pipeline for entire batch
+    result = run_batch_tdd(batch, llm)
 
     completed = sum(1 for t in batch.tasks if t.status == "completed")
-    failed = sum(1 for t in batch.tasks if t.status == "failed")
-    print(f"[PM] Batch finished: {completed} completed, {failed} failed, {len(tasks)} total")
+    print(f"[PM] Batch finished: {batch.status} (TDD {'passed' if result.success else 'failed'}, "
+          f"{len(batch.tasks)} tasks tracked)")
     return batch
 
 
@@ -431,7 +420,7 @@ def resume_batch(
     batch_dir: str | Path,
     llm: LLM | None = None,
 ) -> BatchState:
-    """Resume a batch from its last incomplete task."""
+    """Resume a batch — re-run TDD if not yet completed."""
     if llm is None:
         llm = create_llm()
 
@@ -442,46 +431,38 @@ def resume_batch(
         batch_id=progress["batch_id"],
         project_name=progress["project_name"],
         batch_dir=batch_dir,
-        status="in_progress",
+        status=progress.get("status", "pending"),
     )
 
-    # Reload tasks from task.json files
+    # Reload tasks from task.json files (for display)
     tasks_root = batch_dir / "tasks"
-    if not tasks_root.exists():
-        batch.status = "failed"
-        batch.error = "No tasks directory found"
+    if tasks_root.exists():
+        task_dirs = sorted(tasks_root.iterdir())
+        for td in task_dirs:
+            if not td.is_dir():
+                continue
+            tj = td / "task.json"
+            if not tj.exists():
+                continue
+            data = _read_json(tj)
+            batch.tasks.append(TaskState(
+                id=data["id"],
+                title=data["title"],
+                description=data.get("description", ""),
+                status=data["status"],
+                dependencies=data.get("dependencies", []),
+                assigned_module=data.get("assigned_module"),
+                task_dir=td,
+            ))
+
+    # If already completed, nothing to do
+    if batch.status == "completed":
+        print(f"[PM] Batch {batch.batch_id} already completed")
         return batch
 
-    task_dirs = sorted(tasks_root.iterdir())
-    for td in task_dirs:
-        if not td.is_dir():
-            continue
-        tj = td / "task.json"
-        if not tj.exists():
-            continue
-        data = _read_json(tj)
-        batch.tasks.append(TaskState(
-            id=data["id"],
-            title=data["title"],
-            description=data.get("description", ""),
-            status=data["status"],
-            dependencies=data.get("dependencies", []),
-            assigned_module=data.get("assigned_module"),
-            task_dir=td,
-        ))
+    print(f"[PM] Resuming batch {batch.batch_id}")
 
-    print(f"[PM] Resuming batch {batch.batch_id} — {len(batch.tasks)} tasks")
-
-    # Run remaining tasks
-    for task in batch.tasks:
-        if task.status in ("completed", "skipped"):
-            continue
-        # Reset failed tasks to pending for retry
-        if task.status == "failed":
-            task.status = "pending"
-        run_task(batch, task, llm)
-
-    all_done = all(t.status in ("completed", "skipped") for t in batch.tasks)
-    batch.status = "completed" if all_done else "failed"
-    _save_progress(batch)
+    # Re-run TDD pipeline (clean workspace)
+    result = run_batch_tdd(batch, llm)
+    print(f"[PM] Resume finished: {batch.status} (TDD {'passed' if result.success else 'failed'})")
     return batch
