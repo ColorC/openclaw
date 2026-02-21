@@ -22,6 +22,7 @@ and process access when the model does something dumb.
 - Optional sandboxed browser (`agents.defaults.sandbox.browser`).
   - By default, the sandbox browser auto-starts (ensures CDP is reachable) when the browser tool needs it.
     Configure via `agents.defaults.sandbox.browser.autoStart` and `agents.defaults.sandbox.browser.autoStartTimeoutMs`.
+  - noVNC observer access is password-protected by default; OpenClaw emits an auto-connect URL with password query parameter.
   - `agents.defaults.sandbox.browser.allowHostControl` lets sandboxed sessions target the host browser explicitly.
   - Optional allowlists gate `target: "custom"`: `allowedControlUrls`, `allowedControlHosts`, `allowedControlPorts`.
 
@@ -76,7 +77,7 @@ Global and per-agent binds are **merged** (not replaced). Under `scope: "shared"
 - When set (including `[]`), it replaces `agents.defaults.sandbox.docker.binds` for the browser container.
 - When omitted, the browser container falls back to `agents.defaults.sandbox.docker.binds` (backwards compatible).
 
-Example (read-only source + docker socket):
+Example (read-only source + an extra data directory):
 
 ```json5
 {
@@ -84,7 +85,7 @@ Example (read-only source + docker socket):
     defaults: {
       sandbox: {
         docker: {
-          binds: ["/home/user/source:/source:ro", "/var/run/docker.sock:/var/run/docker.sock"],
+          binds: ["/home/user/source:/source:ro", "/var/data/myapp:/data:ro"],
         },
       },
     },
@@ -105,7 +106,8 @@ Example (read-only source + docker socket):
 Security notes:
 
 - Binds bypass the sandbox filesystem: they expose host paths with whatever mode you set (`:ro` or `:rw`).
-- Sensitive mounts (e.g., `docker.sock`, secrets, SSH keys) should be `:ro` unless absolutely required.
+- OpenClaw blocks dangerous bind sources (for example: `docker.sock`, `/etc`, `/proc`, `/sys`, `/dev`, and parent mounts that would expose them).
+- Sensitive mounts (secrets, SSH keys, service credentials) should be `:ro` unless absolutely required.
 - Combine with `workspaceAccess: "ro"` if you only need read access to the workspace; bind modes stay independent.
 - See [Sandbox vs Tool Policy vs Elevated](/gateway/sandbox-vs-tool-policy-vs-elevated) for how binds interact with tool policy and elevated exec.
 

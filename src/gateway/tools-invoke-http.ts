@@ -10,7 +10,11 @@ import {
   applyToolPolicyPipeline,
   buildDefaultToolPolicyPipelineSteps,
 } from "../agents/tool-policy-pipeline.js";
-import { collectExplicitAllowlist, resolveToolProfilePolicy } from "../agents/tool-policy.js";
+import {
+  collectExplicitAllowlist,
+  mergeAlsoAllowPolicy,
+  resolveToolProfilePolicy,
+} from "../agents/tool-policy.js";
 import { ToolInputError } from "../agents/tools/common.js";
 import { loadConfig } from "../config/config.js";
 import { resolveMainSessionKey } from "../config/sessions.js";
@@ -20,7 +24,7 @@ import { getPluginToolMeta } from "../plugins/tools.js";
 import { isSubagentSessionKey } from "../routing/session-key.js";
 import { DEFAULT_GATEWAY_HTTP_TOOL_DENY } from "../security/dangerous-tools.js";
 import { normalizeMessageChannel } from "../utils/message-channel.js";
-import { authorizeGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
+import { authorizeHttpGatewayConnect, type ResolvedGatewayAuth } from "./auth.js";
 import {
   readJsonBodyOrError,
   sendGatewayAuthFailure,
@@ -127,6 +131,7 @@ export async function handleToolsInvokeHttpRequest(
     auth: ResolvedGatewayAuth;
     maxBodyBytes?: number;
     trustedProxies?: string[];
+    allowRealIpFallback?: boolean;
     rateLimiter?: AuthRateLimiter;
   },
 ): Promise<boolean> {
@@ -142,11 +147,12 @@ export async function handleToolsInvokeHttpRequest(
 
   const cfg = loadConfig();
   const token = getBearerToken(req);
-  const authResult = await authorizeGatewayConnect({
+  const authResult = await authorizeHttpGatewayConnect({
     auth: opts.auth,
     connectAuth: token ? { token, password: token } : null,
     req,
     trustedProxies: opts.trustedProxies ?? cfg.gateway?.trustedProxies,
+    allowRealIpFallback: opts.allowRealIpFallback ?? cfg.gateway?.allowRealIpFallback,
     rateLimiter: opts.rateLimiter,
   });
   if (!authResult.ok) {
@@ -215,15 +221,8 @@ export async function handleToolsInvokeHttpRequest(
   const profilePolicy = resolveToolProfilePolicy(profile);
   const providerProfilePolicy = resolveToolProfilePolicy(providerProfile);
 
-  const mergeAlsoAllow = (policy: typeof profilePolicy, alsoAllow?: string[]) => {
-    if (!policy?.allow || !Array.isArray(alsoAllow) || alsoAllow.length === 0) {
-      return policy;
-    }
-    return { ...policy, allow: Array.from(new Set([...policy.allow, ...alsoAllow])) };
-  };
-
-  const profilePolicyWithAlsoAllow = mergeAlsoAllow(profilePolicy, profileAlsoAllow);
-  const providerProfilePolicyWithAlsoAllow = mergeAlsoAllow(
+  const profilePolicyWithAlsoAllow = mergeAlsoAllowPolicy(profilePolicy, profileAlsoAllow);
+  const providerProfilePolicyWithAlsoAllow = mergeAlsoAllowPolicy(
     providerProfilePolicy,
     providerProfileAlsoAllow,
   );
