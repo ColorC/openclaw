@@ -34,6 +34,14 @@ from toyshop.tdd_pipeline import (
     TDDResult,
 )
 
+# PM System
+from toyshop.pm import (
+    run_batch,
+    resume_batch,
+    BatchState,
+    TaskState,
+)
+
 # Debug subsystems
 from toyshop.debug_hypothesis import DebugReport, DebugHypothesis, CodingChallenge
 from toyshop.debug_probe import ProbeInstrumentor, DiagnosticProbe
@@ -65,6 +73,11 @@ __all__ = [
     # TDD Pipeline
     "run_tdd_pipeline",
     "TDDResult",
+    # PM System
+    "run_batch",
+    "resume_batch",
+    "BatchState",
+    "TaskState",
     # Debug subsystems
     "DebugReport",
     "DebugHypothesis",

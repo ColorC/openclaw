@@ -998,6 +998,7 @@ def run_tdd_pipeline(
     mode: str = "create",
     project_id: str | None = None,
     change_request: str | None = None,
+    log_dir: Path | None = None,
 ) -> TDDResult:
     """Run the TDD pipeline: signatures → tests → code → verify.
 
@@ -1008,6 +1009,7 @@ def run_tdd_pipeline(
         mode: "create" for greenfield, "modify" for brownfield
         project_id: Project ID for loading architecture (modify mode)
         change_request: Description of changes (modify mode)
+        log_dir: If set, save agent conversation logs to this directory
 
     Returns:
         TDDResult with full pipeline results
@@ -1045,6 +1047,8 @@ def run_tdd_pipeline(
         f"Create test files in the tests/ directory."
     )
     test_conv.run()
+    if log_dir:
+        _save_agent_log(test_conv, log_dir, "phase2_test")
 
     # Check if test agent tried to edit business code
     test_violations = _detect_boundary_violations(test_conv, "test")
@@ -1126,6 +1130,8 @@ def run_tdd_pipeline(
 
         code_conv.send_message(code_prompt)
         code_conv.run()
+        if log_dir:
+            _save_agent_log(code_conv, log_dir, f"phase3_code_attempt{retry_count + 1}")
 
         # Extract finish message to check for challenges
         finish_msg = _extract_finish_message(code_conv)
@@ -1176,6 +1182,8 @@ def run_tdd_pipeline(
             )
             test_fix_conv.send_message(fix_prompt)
             test_fix_conv.run()
+            if log_dir:
+                _save_agent_log(test_fix_conv, log_dir, f"phase3_5_testfix_attempt{retry_count + 1}")
 
         # ── Phase 4: White-box Verification ──
         print("[TDD] Phase 4: White-box Verification")
@@ -1188,6 +1196,8 @@ def run_tdd_pipeline(
             "Report the full output and whether all tests passed."
         )
         wb_conv.run()
+        if log_dir:
+            _save_agent_log(wb_conv, log_dir, f"phase4_verify_attempt{retry_count + 1}")
 
         whitebox_output = _extract_test_output_from_conversation(wb_conv)
         wb_result = parse_pytest_output(whitebox_output)
@@ -1228,6 +1238,8 @@ def run_tdd_pipeline(
                 "Run `pytest tests/test_blackbox_auto.py -v` to verify they pass."
             )
             bb_write_conv.run()
+            if log_dir:
+                _save_agent_log(bb_write_conv, log_dir, "phase5a_bb_write")
 
             # Check if blackbox test agent tried to edit business code
             bb_violations = _detect_boundary_violations(bb_write_conv, "test")
@@ -1248,6 +1260,8 @@ def run_tdd_pipeline(
                     "Report the full output and whether all tests passed."
                 )
                 bb_verify_conv.run()
+                if log_dir:
+                    _save_agent_log(bb_verify_conv, log_dir, "phase5b_bb_verify")
 
                 blackbox_output = _extract_test_output_from_conversation(bb_verify_conv)
                 bb_result = parse_pytest_output(blackbox_output)
@@ -1426,6 +1440,34 @@ def _extract_finish_message(conversation: Conversation) -> str:
     except Exception:
         pass
     return ""
+
+
+def _save_agent_log(
+    conversation: Conversation, log_dir: Path, phase_name: str,
+) -> None:
+    """Save conversation events as a readable log file."""
+    from openhands.sdk.event import ActionEvent, ObservationEvent
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = []
+    try:
+        for event in conversation.state.events:
+            if isinstance(event, ActionEvent):
+                lines.append(f"[ACTION] {event.action.__class__.__name__}")
+                if hasattr(event.action, "message") and event.action.message:
+                    lines.append(f"  {event.action.message[:500]}")
+            elif isinstance(event, ObservationEvent):
+                text = ""
+                if hasattr(event, "observation") and hasattr(event.observation, "content"):
+                    for item in event.observation.content:
+                        if hasattr(item, "text"):
+                            text += item.text
+                if text:
+                    lines.append(f"[OBS] {text[:1000]}")
+    except Exception:
+        lines.append("[ERROR] Failed to extract some events")
+
+    (log_dir / f"{phase_name}.log").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _extract_failing_test_names(test_output: str) -> list[str]:
