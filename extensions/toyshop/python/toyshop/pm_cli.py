@@ -4,11 +4,17 @@ Usage:
   # Full auto pipeline (existing)
   python3 -m toyshop.pm_cli run --name <project> --input <file_or_text> [--pm-root <dir>]
 
-  # Step-by-step (for supervised development)
+  # Step-by-step greenfield
   python3 -m toyshop.pm_cli create --name <project> --input <file_or_text> [--pm-root <dir>]
   python3 -m toyshop.pm_cli spec   --batch <batch_dir>
   python3 -m toyshop.pm_cli tasks  --batch <batch_dir>
   python3 -m toyshop.pm_cli tdd    --batch <batch_dir>
+
+  # Step-by-step change (brownfield)
+  python3 -m toyshop.pm_cli change-create  --name <project> --workspace <dir> --input <change_req> [--pm-root <dir>]
+  python3 -m toyshop.pm_cli change-analyze --batch <batch_dir>
+  python3 -m toyshop.pm_cli change-spec    --batch <batch_dir>
+  python3 -m toyshop.pm_cli tdd            --batch <batch_dir>   # auto-detects mode
 
   # Utilities
   python3 -m toyshop.pm_cli status --batch <batch_dir>
@@ -74,13 +80,23 @@ def cmd_tasks(args: argparse.Namespace) -> None:
 
 
 def cmd_tdd(args: argparse.Namespace) -> None:
-    """Step 4: Run TDD pipeline for the batch."""
+    """Step 4: Run TDD pipeline for the batch (auto-detects create/modify mode)."""
     from toyshop.pm import load_batch, run_batch_tdd
     from toyshop.llm import create_llm
 
     batch = load_batch(args.batch)
     llm = create_llm()
-    result = run_batch_tdd(batch, llm)
+
+    # Auto-detect mode from batch metadata
+    meta_path = Path(args.batch) / "batch_meta.json"
+    mode = "create"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("type") == "change":
+            mode = "modify"
+    print(f"TDD mode: {mode}")
+
+    result = run_batch_tdd(batch, llm, mode=mode)
     print(f"\nTDD result: {'PASS' if result.success else 'FAIL'}")
     print(f"  Whitebox: {'pass' if result.whitebox_passed else 'fail'}")
     print(f"  Blackbox: {'pass' if result.blackbox_passed else 'fail'}")
@@ -133,6 +149,66 @@ def cmd_resume(args: argparse.Namespace) -> None:
     llm = create_llm()
     batch = resume_batch(args.batch, llm)
     _print_result(batch)
+
+
+def cmd_change_create(args: argparse.Namespace) -> None:
+    """Change step 1: Create change batch from existing workspace."""
+    from toyshop.pm import create_change_batch
+
+    change_request = _read_input(args.input)
+    batch = create_change_batch(
+        Path(args.pm_root), args.name, Path(args.workspace), change_request,
+    )
+    print(f"Batch dir: {batch.batch_dir}")
+    print("Next: python3 -m toyshop.pm_cli change-analyze --batch", batch.batch_dir)
+
+
+def cmd_change_analyze(args: argparse.Namespace) -> None:
+    """Change step 2: Snapshot code + impact analysis."""
+    from toyshop.pm import load_batch, run_change_analysis
+    from toyshop.llm import create_llm
+
+    batch = load_batch(args.batch)
+    llm = create_llm()
+    impact = run_change_analysis(batch, llm)
+
+    print(f"\nSummary: {impact.change_summary}")
+    if impact.affected_modules:
+        print("Affected modules:")
+        for m in impact.affected_modules:
+            print(f"  [{m.change_type}] {m.module_name}: {m.reason}")
+    if impact.affected_interfaces:
+        print("Affected interfaces:")
+        for i in impact.affected_interfaces:
+            print(f"  [{i.change_type}] {i.interface_name}: {i.reason}")
+    if impact.new_modules:
+        print("New modules:")
+        for n in impact.new_modules:
+            print(f"  {n.name} ({n.file_path}): {n.description}")
+
+    print("\nReview impact.json, then:")
+    print("  python3 -m toyshop.pm_cli change-spec --batch", args.batch)
+
+
+def cmd_change_spec(args: argparse.Namespace) -> None:
+    """Change step 3: Evolve openspec docs based on impact."""
+    from toyshop.pm import load_batch, run_spec_evolution
+    from toyshop.impact import load_impact
+    from toyshop.llm import create_llm
+
+    batch = load_batch(args.batch)
+    impact_path = Path(args.batch) / "impact.json"
+    if not impact_path.exists():
+        print("No impact.json found. Run change-analyze first.")
+        sys.exit(1)
+
+    impact = load_impact(impact_path)
+    llm = create_llm()
+    batch = run_spec_evolution(batch, impact, llm)
+    _print_result(batch)
+
+    print("\nReview updated openspec/ docs, then:")
+    print("  python3 -m toyshop.pm_cli tdd --batch", args.batch)
 
 
 # --- Helpers ---
@@ -188,11 +264,29 @@ def main() -> None:
     p_resume = sub.add_parser("resume", help="Resume interrupted batch")
     p_resume.add_argument("--batch", required=True)
 
+    # change-create
+    p_cc = sub.add_parser("change-create", help="Change step 1: Create change batch")
+    p_cc.add_argument("--name", required=True)
+    p_cc.add_argument("--workspace", required=True, help="Path to existing workspace")
+    p_cc.add_argument("--input", required=True, help="Change request text or path to .md file")
+    p_cc.add_argument("--pm-root", default=str(Path.home() / ".toyshop" / "projects"))
+
+    # change-analyze
+    p_ca = sub.add_parser("change-analyze", help="Change step 2: Snapshot + impact analysis")
+    p_ca.add_argument("--batch", required=True)
+
+    # change-spec
+    p_cs = sub.add_parser("change-spec", help="Change step 3: Evolve openspec docs")
+    p_cs.add_argument("--batch", required=True)
+
     args = parser.parse_args()
     cmd = {
         "run": cmd_run, "create": cmd_create, "spec": cmd_spec,
         "tasks": cmd_tasks, "tdd": cmd_tdd, "status": cmd_status,
         "resume": cmd_resume,
+        "change-create": cmd_change_create,
+        "change-analyze": cmd_change_analyze,
+        "change-spec": cmd_change_spec,
     }
     cmd[args.command](args)
 

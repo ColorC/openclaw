@@ -1,12 +1,18 @@
 """PM System — File-based project management with end-to-end pipeline.
 
-Workflow:
+Greenfield workflow:
   1. create_batch()        — create batch folder, save requirements.md
   2. run_spec_generation()  — requirement + architecture workflows → openspec docs
   3. prepare_tasks()        — parse tasks.md → create task folders (display only)
   4. run_batch_tdd()        — run single TDD pipeline for entire batch
   5. run_batch()            — orchestrate 1-4 serially
   6. resume_batch()         — resume if TDD not yet completed
+
+Change (brownfield) workflow:
+  1. create_change_batch()  — create batch from existing workspace + change request
+  2. run_change_analysis()  — snapshot code + LLM impact analysis
+  3. run_spec_evolution()   — update openspec docs based on impact
+  4. run_batch_tdd(mode="modify") — incremental TDD pipeline
 """
 
 from __future__ import annotations
@@ -23,6 +29,15 @@ from toyshop.llm import LLM, create_llm
 from toyshop.workflows.requirement import run_requirement_workflow
 from toyshop.workflows.architecture import run_architecture_workflow
 from toyshop.tdd_pipeline import run_tdd_pipeline, TDDResult
+from toyshop.snapshot import create_snapshot, save_snapshot, CodeSnapshot
+from toyshop.impact import (
+    run_impact_analysis, save_impact, load_impact, ImpactAnalysis,
+    check_architecture_health,
+)
+from toyshop.spec_evolution import (
+    evolve_proposal, evolve_design, evolve_tasks, evolve_spec,
+    verify_evolution,
+)
 
 
 # =============================================================================
@@ -334,9 +349,13 @@ def prepare_tasks(batch: BatchState) -> list[TaskState]:
     return task_states
 
 
-def run_batch_tdd(batch: BatchState, llm: LLM) -> TDDResult:
-    """Run a single TDD pipeline for the entire batch."""
-    print("[PM] Running TDD pipeline for batch")
+def run_batch_tdd(batch: BatchState, llm: LLM, mode: str = "create") -> TDDResult:
+    """Run a single TDD pipeline for the entire batch.
+
+    Args:
+        mode: "create" for greenfield, "modify" for change pipeline.
+    """
+    print(f"[PM] Running TDD pipeline for batch (mode={mode})")
     batch.status = "in_progress"
     _save_progress(batch)
 
@@ -356,6 +375,7 @@ def run_batch_tdd(batch: BatchState, llm: LLM) -> TDDResult:
         result = run_tdd_pipeline(
             workspace=workspace,
             llm=llm,
+            mode=mode,
             log_dir=log_dir,
         )
     except Exception as e:
@@ -470,4 +490,198 @@ def resume_batch(
 
     result = run_batch_tdd(batch, llm)
     print(f"[PM] Resume finished: {batch.status} (TDD {'passed' if result.success else 'failed'})")
+    return batch
+
+
+# =============================================================================
+# Change (brownfield) pipeline
+# =============================================================================
+
+def create_change_batch(
+    pm_root: str | Path,
+    project_name: str,
+    workspace_path: str | Path,
+    change_request: str,
+) -> BatchState:
+    """Create a change batch from an existing workspace + change request.
+
+    Copies the existing workspace and openspec into the new batch directory.
+    """
+    pm_root = Path(pm_root)
+    pm_root.mkdir(parents=True, exist_ok=True)
+    workspace_path = Path(workspace_path)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch_id = f"{timestamp}_change_{_slugify(project_name)}"
+    batch_dir = pm_root / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save change request
+    (batch_dir / "change_request.md").write_text(
+        f"# Change Request: {project_name}\n\n{change_request}\n",
+        encoding="utf-8",
+    )
+
+    # Copy existing workspace
+    ws_dest = batch_dir / "workspace"
+    shutil.copytree(workspace_path, ws_dest)
+
+    # Copy openspec if it exists in workspace
+    ws_openspec = ws_dest / "openspec"
+    if ws_openspec.exists():
+        openspec_dest = batch_dir / "openspec"
+        if openspec_dest.exists():
+            shutil.rmtree(openspec_dest)
+        shutil.copytree(ws_openspec, openspec_dest)
+
+    # Mark as change batch
+    batch = BatchState(
+        batch_id=batch_id,
+        project_name=project_name,
+        batch_dir=batch_dir,
+        status="pending",
+    )
+    _write_json(batch_dir / "batch_meta.json", {
+        "type": "change",
+        "source_workspace": str(workspace_path),
+    })
+    _save_progress(batch)
+    print(f"[PM] Created change batch: {batch_dir}")
+    return batch
+
+
+def run_change_analysis(
+    batch: BatchState,
+    llm: LLM,
+) -> ImpactAnalysis:
+    """Phase 1+2: Snapshot code + LLM impact analysis.
+
+    Creates code snapshot, runs impact analysis against design.md + spec.md,
+    runs architecture guard, saves results.
+    """
+    print("[PM] Running change analysis (snapshot → impact)")
+    batch.status = "in_progress"
+    _save_progress(batch)
+
+    workspace = batch.batch_dir / "workspace"
+    openspec_dir = batch.batch_dir / "openspec"
+
+    # Phase 1: Code snapshot
+    snapshot = create_snapshot(workspace, batch.project_name)
+    save_snapshot(snapshot, batch.batch_dir / "snapshot.json")
+    print(f"  Snapshot: {len(snapshot.modules)} modules")
+
+    # Read current openspec docs
+    design_md = ""
+    spec_md = ""
+    if (openspec_dir / "design.md").exists():
+        design_md = (openspec_dir / "design.md").read_text(encoding="utf-8")
+    if (openspec_dir / "spec.md").exists():
+        spec_md = (openspec_dir / "spec.md").read_text(encoding="utf-8")
+
+    change_request = (batch.batch_dir / "change_request.md").read_text(encoding="utf-8")
+
+    # Phase 2: Impact analysis
+    impact = run_impact_analysis(
+        change_request=change_request,
+        snapshot=snapshot,
+        design_md=design_md,
+        spec_md=spec_md,
+        llm=llm,
+    )
+
+    # Architecture guard (advisory)
+    # Parse design into structured form for health check
+    from toyshop.tdd_pipeline import _parse_design_modules, _parse_design_interfaces
+    if design_md:
+        from types import SimpleNamespace
+        raw_modules = _parse_design_modules(design_md)
+        raw_interfaces = _parse_design_interfaces(design_md)
+        # Build lightweight objects for health check
+        modules = [SimpleNamespace(
+            id=m.get("id", ""), name=m.get("name", ""),
+            responsibilities=m.get("responsibilities", []),
+            dependencies=m.get("dependencies", []),
+        ) for m in raw_modules]
+        interfaces = [SimpleNamespace(
+            id=i.get("id", ""), name=i.get("name", ""),
+            module_id=i.get("module_id", ""),
+        ) for i in raw_interfaces]
+        design_obj = SimpleNamespace(modules=modules, interfaces=interfaces)
+        arch_warnings = check_architecture_health(design_obj)
+        impact.architecture_warnings = arch_warnings
+        if arch_warnings:
+            print(f"  Architecture warnings: {len(arch_warnings)}")
+            for w in arch_warnings:
+                print(f"    ⚠ {w}")
+
+    save_impact(impact, batch.batch_dir / "impact.json")
+    _save_progress(batch)
+
+    print(f"  Impact: {len(impact.affected_modules)} modules, "
+          f"{len(impact.affected_interfaces)} interfaces, "
+          f"{len(impact.affected_scenarios)} scenarios affected")
+    if impact.new_modules:
+        print(f"  New modules: {len(impact.new_modules)}")
+
+    return impact
+
+
+def run_spec_evolution(
+    batch: BatchState,
+    impact: ImpactAnalysis,
+    llm: LLM,
+) -> BatchState:
+    """Phase 3: Update openspec docs based on impact analysis.
+
+    Evolves proposal, design, tasks, and spec in-place.
+    Verifies that unchanged parts are preserved.
+    """
+    print("[PM] Running spec evolution")
+    openspec_dir = batch.batch_dir / "openspec"
+    change_request = (batch.batch_dir / "change_request.md").read_text(encoding="utf-8")
+
+    # Evolve proposal
+    proposal_path = openspec_dir / "proposal.md"
+    if proposal_path.exists():
+        old_proposal = proposal_path.read_text(encoding="utf-8")
+        new_proposal = evolve_proposal(old_proposal, change_request, impact, llm)
+        proposal_path.write_text(new_proposal, encoding="utf-8")
+        print("  Updated proposal.md")
+
+    # Evolve design
+    design_path = openspec_dir / "design.md"
+    if design_path.exists():
+        old_design = design_path.read_text(encoding="utf-8")
+        new_design = evolve_design(old_design, impact, llm)
+        design_path.write_text(new_design, encoding="utf-8")
+        print("  Updated design.md")
+
+        # Verify evolution
+        warnings = verify_evolution(old_design, new_design, impact)
+        if warnings:
+            print(f"  Evolution warnings: {len(warnings)}")
+            for w in warnings:
+                print(f"    ⚠ {w}")
+
+    # Evolve tasks (generate change-only tasks)
+    new_tasks = evolve_tasks(impact, llm)
+    (openspec_dir / "tasks.md").write_text(new_tasks, encoding="utf-8")
+    print("  Updated tasks.md")
+
+    # Evolve spec
+    spec_path = openspec_dir / "spec.md"
+    if spec_path.exists():
+        old_spec = spec_path.read_text(encoding="utf-8")
+        new_spec = evolve_spec(old_spec, impact, llm)
+        spec_path.write_text(new_spec, encoding="utf-8")
+        print("  Updated spec.md")
+
+    # Copy updated openspec to workspace
+    ws_openspec = batch.batch_dir / "workspace" / "openspec"
+    if ws_openspec.exists():
+        shutil.rmtree(ws_openspec)
+    shutil.copytree(openspec_dir, ws_openspec)
+
+    _save_progress(batch)
     return batch
