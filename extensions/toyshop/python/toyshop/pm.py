@@ -416,14 +416,8 @@ def run_batch(
     return batch
 
 
-def resume_batch(
-    batch_dir: str | Path,
-    llm: LLM | None = None,
-) -> BatchState:
-    """Resume a batch — re-run TDD if not yet completed."""
-    if llm is None:
-        llm = create_llm()
-
+def load_batch(batch_dir: str | Path) -> BatchState:
+    """Load a BatchState from an existing batch directory."""
     batch_dir = Path(batch_dir)
     progress = _read_json(batch_dir / "progress.json")
 
@@ -434,7 +428,7 @@ def resume_batch(
         status=progress.get("status", "pending"),
     )
 
-    # Reload tasks from task.json files (for display)
+    # Reload tasks from task.json files
     tasks_root = batch_dir / "tasks"
     if tasks_root.exists():
         task_dirs = sorted(tasks_root.iterdir())
@@ -455,14 +449,25 @@ def resume_batch(
                 task_dir=td,
             ))
 
-    # If already completed, nothing to do
+    return batch
+
+
+def resume_batch(
+    batch_dir: str | Path,
+    llm: LLM | None = None,
+) -> BatchState:
+    """Resume a batch — re-run TDD if not yet completed."""
+    if llm is None:
+        llm = create_llm()
+
+    batch = load_batch(batch_dir)
+
     if batch.status == "completed":
         print(f"[PM] Batch {batch.batch_id} already completed")
         return batch
 
     print(f"[PM] Resuming batch {batch.batch_id}")
 
-    # Re-run TDD pipeline (clean workspace)
     result = run_batch_tdd(batch, llm)
     print(f"[PM] Resume finished: {batch.status} (TDD {'passed' if result.success else 'failed'})")
     return batch
