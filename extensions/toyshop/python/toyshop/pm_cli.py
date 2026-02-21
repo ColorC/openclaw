@@ -214,9 +214,12 @@ def cmd_change_spec(args: argparse.Namespace) -> None:
 # --- Helpers ---
 
 def _read_input(input_arg: str) -> str:
-    input_path = Path(input_arg)
-    if input_path.is_file():
-        return input_path.read_text(encoding="utf-8")
+    try:
+        input_path = Path(input_arg)
+        if input_path.is_file():
+            return input_path.read_text(encoding="utf-8")
+    except OSError:
+        pass
     return input_arg
 
 
