@@ -1303,7 +1303,7 @@ def _parse_per_test_results(output: str) -> list[PerTestResult]:
 
     Matches lines like:
       tests/test_calc.py::test_add PASSED
-      tests/test_calc.py::test_div FAILED
+      tests/test_calc.py::TestClass::test_method FAILED
     Also extracts failure messages from FAILURES section.
     """
     results: list[PerTestResult] = []
@@ -1312,8 +1312,8 @@ def _parse_per_test_results(output: str) -> list[PerTestResult]:
     # Parse per-test status lines
     for line in output.split("\n"):
         line = line.strip()
-        # Match: path::test_name STATUS
-        m = re.match(r"([\w/\\._-]+::[\w_]+)\s+(PASSED|FAILED|ERROR|SKIPPED)", line)
+        # Match: path::test_name or path::Class::test_name STATUS
+        m = re.match(r"([\w/\\._-]+::[\w_]+(?:::[\w_]+)?)\s+(PASSED|FAILED|ERROR|SKIPPED)", line)
         if m:
             test_id = m.group(1)
             status = m.group(2).lower()
