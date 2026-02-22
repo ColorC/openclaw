@@ -1,5 +1,0 @@
-openhands-sdk
-
-[dev]
-pytest
-pytest-asyncio

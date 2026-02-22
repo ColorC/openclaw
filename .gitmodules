@@ -4,3 +4,6 @@
 [submodule "vendor/openspec"]
 	path = vendor/openspec
 	url = https://github.com/ColorC/OpenSpec-ToyShop.git
+[submodule "extensions/toyshop/python"]
+	path = extensions/toyshop/python
+	url = https://github.com/ColorC/toyshop.git
