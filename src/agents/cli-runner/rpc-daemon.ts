@@ -79,18 +79,45 @@ export function startRpcDaemon() {
                 uniqueKeys.add(cliKey);
               }
               const sorted = Array.from(uniqueKeys).toSorted();
-              dynamicList = sorted.map((k) => `  ${k.padEnd(20)} - Tool command`).join("\n");
+
+              const lines = [];
+              for (const k of sorted) {
+                // If it's a macro, hardcode its compact usage
+                if (k === "session") {
+                  lines.push(
+                    `openclaw-tool session [xyz] [--log] [--spawn] [--agent] [--subagents]`,
+                  );
+                  continue;
+                }
+                if (k === "feishu chat") {
+                  lines.push(
+                    `openclaw-tool feishu chat <action> <chat_id> [--page_size] [--page_token]`,
+                  );
+                  continue;
+                }
+
+                // Generic extraction
+                const t = toolMap.get(k);
+                if (t && typeof t === "object" && "parameters" in t) {
+                  const params = t.parameters as Record<string, unknown> | undefined;
+                  if (params && params.properties) {
+                    const props = params.properties as Record<string, unknown>;
+                    const flags = Object.keys(props)
+                      .map((prop) => `[--${prop}]`)
+                      .join(" ");
+                    lines.push(`openclaw-tool ${k} ${flags}`);
+                  } else {
+                    lines.push(`openclaw-tool ${k}`);
+                  }
+                } else {
+                  lines.push(`openclaw-tool ${k}`);
+                }
+              }
+              // Deduplicate lines (since some custom mappers might overlap with generic ones)
+              dynamicList = Array.from(new Set(lines)).join("\n");
             }
 
-            const helpText = `OpenClaw-Tool (Agent CLI Interface)
-
-Usage: openclaw-tool <command> [subcommand] [options]
-
-Available Commands in Current Context:
-${dynamicList || "  (No tools registered in this context)"}
-
-Type 'openclaw-tool <command> --help' to see specific parameters.
-`;
+            const helpText = dynamicList || "No tools registered.";
 
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
