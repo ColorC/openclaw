@@ -1,5 +1,6 @@
 import type { AnyAgentTool } from "../pi-tools.types.js";
 import { feishuChatMapper } from "./mappers/feishu-chat.js";
+import { sessionMacroMapper } from "./mappers/session.js";
 import { defaultGenericParser } from "./mappers/types.js";
 
 // Session-aware tool stash to bridge from the Agent's in-memory tool array to the RPC Daemon
@@ -8,6 +9,11 @@ const sessionTools = new Map<string, Map<string, AnyAgentTool>>();
 // Registry of custom mappers to override generic behavior
 const customMappers = new Map<string, typeof feishuChatMapper>([
   [feishuChatMapper.commandKey, feishuChatMapper],
+]);
+
+// Registry of macro mappers that take over a top-level command and route to underlying tools
+export const macroMappers = new Map<string, typeof sessionMacroMapper>([
+  [sessionMacroMapper.commandKey, sessionMacroMapper],
 ]);
 
 export function getCustomMapper(cliCommandKey: string) {
@@ -41,7 +47,18 @@ export function resolveCommand(sessionKey: string, args: string[]) {
     return null;
   }
 
-  // Try 2-part commands first (e.g., "feishu update")
+  // 1. Check Macro Mappers first (e.g. "session")
+  if (args.length >= 1) {
+    const macro = macroMappers.get(args[0] || "");
+    if (macro) {
+      const resolved = macro.resolveMacro(args.slice(1), toolMap);
+      if (resolved) {
+        return resolved;
+      }
+    }
+  }
+
+  // 2. Try 2-part commands (e.g., "feishu update")
   if (args.length >= 2) {
     const key = `${args[0]} ${args[1]}`;
     const tool = toolMap.get(key);
@@ -54,7 +71,7 @@ export function resolveCommand(sessionKey: string, args: string[]) {
     }
   }
 
-  // Try 1-part commands (e.g., "subagents")
+  // 3. Try 1-part commands (e.g., "subagents")
   if (args.length >= 1) {
     const key = args[0] || "";
     const tool = toolMap.get(key);

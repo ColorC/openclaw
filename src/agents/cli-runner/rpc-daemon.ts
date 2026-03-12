@@ -30,16 +30,22 @@ export function startRpcDaemon() {
             if (baseArgs.length > 0) {
               const cmd = resolveCommand(sessionKey, baseArgs);
               if (cmd) {
-                const { getCustomMapper } = require("./registry.js");
-                const cliKey = baseArgs.slice(0, 2).join(" "); // simplistic assumption for now
-                const mapper = getCustomMapper(cliKey) || getCustomMapper(baseArgs[0]);
+                const { getCustomMapper, macroMappers } = require("./registry.js");
+                const macro = macroMappers.get(baseArgs[0]);
 
                 let helpResult = "";
-                if (mapper && mapper.generateHelp) {
-                  helpResult = mapper.generateHelp(cmd.tool, cliKey);
+                if (macro) {
+                  helpResult = macro.generateHelp();
                 } else {
-                  const { defaultGenericHelp } = require("./mappers/types.js");
-                  helpResult = defaultGenericHelp(cmd.tool, baseArgs.join(" "));
+                  const cliKey = baseArgs.slice(0, 2).join(" "); // simplistic assumption for now
+                  const mapper = getCustomMapper(cliKey) || getCustomMapper(baseArgs[0]);
+
+                  if (mapper && mapper.generateHelp) {
+                    helpResult = mapper.generateHelp(cmd.tool, cliKey);
+                  } else {
+                    const { defaultGenericHelp } = require("./mappers/types.js");
+                    helpResult = defaultGenericHelp(cmd.tool, baseArgs.join(" "));
+                  }
                 }
 
                 res.writeHead(200, { "Content-Type": "application/json" });
