@@ -25,12 +25,32 @@ export function startRpcDaemon() {
           // Handle --help injection later. For now, execute.
 
           if (args.includes("--help") || args.includes("-h")) {
-            // Very simple mock for help
+            const helpText = `OpenClaw-Tool (Agent CLI Interface)
+
+          Usage: openclaw-tool <command> [subcommand] [options]
+
+          Commands by Cluster:
+          Agents & Sessions Management
+          agents list          - List OpenClaw agent ids you can target
+          sessions list        - List active and historical chat sessions
+          sessions history     - Retrieve transcript for a specific session
+          sessions status      - Get realtime status of an active session
+
+          Integrations & Plugins
+          feishu *             - Feishu workspace and project commands (try openclaw-tool feishu --help)
+          discord *            - Discord channel management
+
+          System & Tools
+          browser *            - Control headless browser operations
+          exec                 - Run low-level host shell commands (raw access)
+          memory *             - Search and retrieve historical context
+
+          (Note: Agent Schema has been dynamically updated with this context. You may now call these commands directly using the chat-bash tool.)`;
+
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({
-                stdout:
-                  "OpenClaw-Tool CLI\n\nUsage: openclaw-tool <command>\n\nCommands:\n  agents list\n  sessions list\n\n(Schema dynamically updated in background)",
+                stdout: helpText,
                 exitCode: 0,
               }),
             );
@@ -53,17 +73,26 @@ export function startRpcDaemon() {
           const tool = cmd.toolDef.factory({ agentSessionKey: sessionKey });
           const toolParams = cmd.toolDef.parseArgs(cmd.commandArgs);
 
-          // Execute
-          const result = await tool.execute(toolParams);
+          // Execute (toolCallId is arbitrary for our CLI)
+          const result = await tool.execute("cli-runner", toolParams);
 
           // Result formatting
           let stdout = "";
-          if (result.type === "json") {
-            stdout = JSON.stringify(result.data, null, 2) + "\n";
-          } else if (result.type === "text") {
-            stdout = result.text + "\n";
+          if (
+            result &&
+            typeof result === "object" &&
+            "content" in result &&
+            Array.isArray(result.content)
+          ) {
+            const textParts = result.content
+              .filter(
+                (c: unknown) =>
+                  typeof c === "object" && c !== null && "type" in c && c.type === "text",
+              )
+              .map((c: unknown) => (c as { text: string }).text);
+            stdout = textParts.join("\n") + "\n";
           } else {
-            stdout = "Command executed successfully.\n";
+            stdout = JSON.stringify(result, null, 2) + "\n";
           }
 
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -91,7 +120,17 @@ export function startRpcDaemon() {
     }
   });
 
-  server.listen(PORT, "127.0.0.1", () => {
-    logInfo(`OpenClaw-Tool RPC Daemon listening on port ${PORT}`);
+  server.on("error", (e: NodeJS.ErrnoException) => {
+    if (e.code === "EADDRINUSE") {
+      logInfo(
+        `OpenClaw-Tool RPC Daemon port ${PORT} is already in use. Assuming daemon is already running.`,
+      );
+    } else {
+      logError(`OpenClaw-Tool RPC Daemon error: ${e.message}`);
+    }
+  });
+
+  server.listen(PORT, "0.0.0.0", () => {
+    logInfo(`OpenClaw-Tool RPC Daemon listening on port ${PORT} (0.0.0.0)`);
   });
 }

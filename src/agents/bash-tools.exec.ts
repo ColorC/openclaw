@@ -43,6 +43,7 @@ import {
   resolveWorkdir,
   truncateMiddle,
 } from "./bash-tools.shared.js";
+import { startRpcDaemon } from "./cli-runner/rpc-daemon.js";
 import { assertSandboxPath } from "./sandbox-paths.js";
 
 export type { BashSandboxConfig } from "./bash-tools.shared.js";
@@ -152,6 +153,9 @@ export function createExecTool(
   defaults?: ExecToolDefaults,
   // oxlint-disable-next-line typescript/no-explicit-any
 ): AgentTool<any, ExecToolDetails> {
+  // Start the RPC Daemon to support openclaw-tool cli operations
+  startRpcDaemon();
+
   const defaultBackgroundMs = clampWithDefault(
     defaults?.backgroundMs ?? readEnvInt("PI_BASH_YIELD_MS"),
     10_000,

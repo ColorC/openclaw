@@ -16,7 +16,6 @@ if (!port) {
 }
 
 async function readStdin() {
-  // If running in a TTY (interactive terminal), don't block waiting for stdin.
   if (process.stdin.isTTY) {
     return "";
   }
@@ -26,10 +25,6 @@ async function readStdin() {
       data += chunk;
     });
     process.stdin.on("end", () => resolve(data));
-
-    // Safety timeout: if stdin stays open without data for 500ms, assume done.
-    // In a real implementation, we might want to handle this differently,
-    // but this prevents the daemon probe from hanging indefinitely.
     const timer = setTimeout(() => resolve(data), 500);
     process.stdin.on("data", () => timer.refresh());
   });
@@ -39,21 +34,47 @@ async function main() {
   const args = process.argv.slice(2);
   const stdinData = await readStdin();
 
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/rpc/openclaw-tool`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-OpenClaw-Session": sessionKey || "",
-      },
-      body: JSON.stringify({
-        args,
-        stdin: stdinData,
-        cwd: process.cwd(),
-      }),
-    });
+  let host = "127.0.0.1";
+  if (process.env.OPENCLAW_GATEWAY_URL) {
+    try {
+      host = new URL(process.env.OPENCLAW_GATEWAY_URL).hostname;
+    } catch {
+      // Ignored
+    }
+  } else if (process.env.PI_IS_SANDBOX) {
+    host = "host.docker.internal";
+  }
 
-    // Parse the response from the daemon
+  let res;
+  try {
+    try {
+      res = await fetch(`http://${host}:${port}/rpc/openclaw-tool`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-OpenClaw-Session": sessionKey || "",
+        },
+        body: JSON.stringify({ args, stdin: stdinData, cwd: process.cwd() }),
+      });
+    } catch (err) {
+      if (host !== "172.17.0.1") {
+        try {
+          res = await fetch(`http://172.17.0.1:${port}/rpc/openclaw-tool`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-OpenClaw-Session": sessionKey || "",
+            },
+            body: JSON.stringify({ args, stdin: stdinData, cwd: process.cwd() }),
+          });
+        } catch {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
+
     const text = await res.text();
     let data;
     try {
@@ -63,7 +84,6 @@ async function main() {
       process.exit(1);
     }
 
-    // Forward the outputs transparently to the bash environment
     if (data.stdout) {
       process.stdout.write(data.stdout);
     }
@@ -71,7 +91,6 @@ async function main() {
       process.stderr.write(data.stderr);
     }
 
-    // Exit with the code instructed by the daemon
     process.exit(data.exitCode ?? (res.ok ? 0 : 1));
   } catch (err) {
     console.error(`openclaw-tool communication error: ${err.message}`);
