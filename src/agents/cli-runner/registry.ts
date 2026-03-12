@@ -1,7 +1,18 @@
 import type { AnyAgentTool } from "../pi-tools.types.js";
+import { feishuChatMapper } from "./mappers/feishu-chat.js";
+import { defaultGenericParser } from "./mappers/types.js";
 
 // Session-aware tool stash to bridge from the Agent's in-memory tool array to the RPC Daemon
 const sessionTools = new Map<string, Map<string, AnyAgentTool>>();
+
+// Registry of custom mappers to override generic behavior
+const customMappers = new Map<string, typeof feishuChatMapper>([
+  [feishuChatMapper.commandKey, feishuChatMapper],
+]);
+
+export function getCustomMapper(cliCommandKey: string) {
+  return customMappers.get(cliCommandKey);
+}
 
 /**
  * Stashes the instantiated tools for a specific session.
@@ -24,39 +35,6 @@ export function getStashedTools(sessionKey: string) {
   return sessionTools.get(sessionKey);
 }
 
-/**
- * Super lightweight CLI argument parser.
- * Converts `--key value` and `--flag` into a JSON object.
- */
-function parseGenericArgs(args: string[]): Record<string, unknown> {
-  const params: Record<string, unknown> = {};
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg && arg.startsWith("--")) {
-      const key = arg.slice(2);
-      if (i + 1 < args.length && !args[i + 1]?.startsWith("--")) {
-        // Look ahead for value
-        const val = args[i + 1];
-        // simple type coercion
-        if (val === "true") {
-          params[key] = true;
-        } else if (val === "false") {
-          params[key] = false;
-        } else if (!Number.isNaN(Number(val)) && val?.trim() !== "") {
-          params[key] = Number(val);
-        } else {
-          params[key] = val;
-        }
-        i++; // skip value
-      } else {
-        // boolean flag
-        params[key] = true;
-      }
-    }
-  }
-  return params;
-}
-
 export function resolveCommand(sessionKey: string, args: string[]) {
   const toolMap = getStashedTools(sessionKey);
   if (!toolMap) {
@@ -68,24 +46,25 @@ export function resolveCommand(sessionKey: string, args: string[]) {
     const key = `${args[0]} ${args[1]}`;
     const tool = toolMap.get(key);
     if (tool) {
+      const mapper = getCustomMapper(key);
       return {
         tool,
-        commandArgs: parseGenericArgs(args.slice(2)),
+        commandArgs: mapper ? mapper.parseArgs(args.slice(2)) : defaultGenericParser(args.slice(2)),
       };
     }
   }
 
   // Try 1-part commands (e.g., "subagents")
   if (args.length >= 1) {
-    const key = args[0];
-    const tool = toolMap.get(key ?? "");
+    const key = args[0] || "";
+    const tool = toolMap.get(key);
     if (tool) {
+      const mapper = getCustomMapper(key);
       return {
         tool,
-        commandArgs: parseGenericArgs(args.slice(1)),
+        commandArgs: mapper ? mapper.parseArgs(args.slice(1)) : defaultGenericParser(args.slice(1)),
       };
     }
   }
-
   return null;
 }

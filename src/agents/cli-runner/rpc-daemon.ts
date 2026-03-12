@@ -25,27 +25,59 @@ export function startRpcDaemon() {
           // Handle --help injection later. For now, execute.
 
           if (args.includes("--help") || args.includes("-h")) {
+            // First check if this is asking for help for a specific command (e.g. openclaw-tool feishu --help)
+            const baseArgs = args.filter((a: string) => a !== "--help" && a !== "-h");
+            if (baseArgs.length > 0) {
+              const cmd = resolveCommand(sessionKey, baseArgs);
+              if (cmd) {
+                const { getCustomMapper } = require("./registry.js");
+                const cliKey = baseArgs.slice(0, 2).join(" "); // simplistic assumption for now
+                const mapper = getCustomMapper(cliKey) || getCustomMapper(baseArgs[0]);
+
+                let helpResult = "";
+                if (mapper && mapper.generateHelp) {
+                  helpResult = mapper.generateHelp(cmd.tool, cliKey);
+                } else {
+                  const { defaultGenericHelp } = require("./mappers/types.js");
+                  helpResult = defaultGenericHelp(cmd.tool, baseArgs.join(" "));
+                }
+
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(
+                  JSON.stringify({
+                    stdout: helpResult,
+                    exitCode: 0,
+                  }),
+                );
+                return;
+              }
+            }
+
+            // Fallback to top-level dynamic help
+            const { getStashedTools } = require("./registry.js");
+            const toolMap = getStashedTools(sessionKey);
+            let dynamicList = "";
+            if (toolMap) {
+              const uniqueKeys = new Set<string>();
+              for (const [cliKey] of toolMap.entries()) {
+                if (cliKey.includes("_")) {
+                  continue; // Skip original names
+                }
+                uniqueKeys.add(cliKey);
+              }
+              const sorted = Array.from(uniqueKeys).toSorted();
+              dynamicList = sorted.map((k) => `  ${k.padEnd(20)} - Tool command`).join("\n");
+            }
+
             const helpText = `OpenClaw-Tool (Agent CLI Interface)
 
-          Usage: openclaw-tool <command> [subcommand] [options]
+Usage: openclaw-tool <command> [subcommand] [options]
 
-          Commands by Cluster:
-          Agents & Sessions Management
-          agents list          - List OpenClaw agent ids you can target
-          sessions list        - List active and historical chat sessions
-          sessions history     - Retrieve transcript for a specific session
-          sessions status      - Get realtime status of an active session
+Available Commands in Current Context:
+${dynamicList || "  (No tools registered in this context)"}
 
-          Integrations & Plugins
-          feishu *             - Feishu workspace and project commands (try openclaw-tool feishu --help)
-          discord *            - Discord channel management
-
-          System & Tools
-          browser *            - Control headless browser operations
-          exec                 - Run low-level host shell commands (raw access)
-          memory *             - Search and retrieve historical context
-
-          (Note: Agent Schema has been dynamically updated with this context. You may now call these commands directly using the chat-bash tool.)`;
+Type 'openclaw-tool <command> --help' to see specific parameters.
+`;
 
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
